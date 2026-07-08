@@ -1711,8 +1711,9 @@ func addLegacyTransferTasks(jobID int64, inputs []TransferTaskInput) (int, error
 // --- Transfer Task Buffer Logic ---
 func checkAndRefillTxBuffers() {
 	var jobs []models.TransferJob
-	// 查找状态为 Running 的 Job
-	if err := database.DB.Where("status IN ?", []models.JobStatus{models.StatusRunning}).Find(&jobs).Error; err != nil {
+	// 查找状态为 Running 或 Pending 的 Job
+	// Pending 状态的 Job 也需要初始化 buffer，等 Scanner 创建任务后可以立即开始传输
+	if err := database.DB.Where("status IN ?", []models.JobStatus{models.StatusRunning, models.StatusPending}).Find(&jobs).Error; err != nil {
 		return
 	}
 

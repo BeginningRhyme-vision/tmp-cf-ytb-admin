@@ -61,17 +61,17 @@ type JobStatsDelta struct {
 }
 
 var (
-	jobCache                   sync.Map // JobID -> cachedJob
-	httpClient                 *http.Client
-	transferClient             *http.Client
-	workerCount                int
-	taskBufferSize             int
-	partConcurrency            int
-	multipartThreshold         int64
-	minPartSize                int64
-	maxRetryCount              int
-	retryBaseDelaySecs         int
-	retryScannerIntervalSecs   int
+	jobCache                 sync.Map // JobID -> cachedJob
+	httpClient               *http.Client
+	transferClient           *http.Client
+	workerCount              int
+	taskBufferSize           int
+	partConcurrency          int
+	multipartThreshold       int64
+	minPartSize              int64
+	maxRetryCount            int
+	retryBaseDelaySecs       int
+	retryScannerIntervalSecs int
 
 	s3Clients sync.Map // Endpoint -> *s3.Client (Cache for Destinations)
 	srcClient *s3.Client
@@ -119,6 +119,26 @@ var (
 		Name: "transfer_task_retry_failed_total",
 		Help: "Total failed retries by retry attempt number",
 	}, []string{"retry_count"})
+
+	ConnPoolActiveGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "transfer_conn_pool_active",
+		Help: "Number of active connections in the connection pool",
+	}, []string{"pool"})
+
+	ConnPoolIdleGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "transfer_conn_pool_idle",
+		Help: "Number of idle connections in the connection pool",
+	}, []string{"pool"})
+
+	ConnPoolWaitCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "transfer_conn_pool_wait_total",
+		Help: "Total number of requests waiting for a connection",
+	}, []string{"pool"})
+
+	ConnPoolUsageGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "transfer_conn_pool_usage",
+		Help: "Connection pool usage percentage (0-1)",
+	}, []string{"pool"})
 )
 
 const (
@@ -171,26 +191,33 @@ func runTransfer() {
 	httpClient = &http.Client{
 		Timeout: 20 * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConns:        256,
-			MaxIdleConnsPerHost: 256,
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: 64,
+			IdleConnTimeout:     60 * time.Second,
+			ForceAttemptHTTP2:   true,
 			DialContext: (&net.Dialer{
 				Timeout:   5 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
 		},
 	}
+
+	transferTransport := &http.Transport{
+		MaxIdleConns:        maxConnections,
+		MaxIdleConnsPerHost: maxConnections / 2,
+		MaxConnsPerHost:     maxConnections,
+		IdleConnTimeout:     300 * time.Second,
+		ForceAttemptHTTP2:   true,
+		DialContext: (&net.Dialer{
+			Timeout:   8 * time.Second,
+			KeepAlive: 120 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+	}
 	transferClient = &http.Client{
-		Timeout: time.Duration(transferTimeoutSecs) * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        maxConnections,
-			MaxIdleConnsPerHost: maxConnections,
-			IdleConnTimeout:     120 * time.Second,
-			DialContext: (&net.Dialer{
-				Timeout:   8 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-		},
+		Timeout:   time.Duration(transferTimeoutSecs) * time.Second,
+		Transport: transferTransport,
 	}
 
 	initSourceClient()
@@ -678,9 +705,26 @@ func createS3Client(endpoint, ak, sk string) (*s3.Client, error) {
 
 	baseEndpoint := fmt.Sprintf("%s://%s", u.Scheme, host)
 
+	httpTransport := &http.Transport{
+		MaxIdleConns:        512,
+		MaxIdleConnsPerHost: 256,
+		MaxConnsPerHost:     512,
+		IdleConnTimeout:     300 * time.Second,
+		ForceAttemptHTTP2:   true,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 120 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+	}
+
 	c, err := awsconfig.LoadDefaultConfig(context.TODO(),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(ak, sk, "")),
 		awsconfig.WithRegion("auto"),
+		awsconfig.WithHTTPClient(&http.Client{
+			Transport: httpTransport,
+		}),
 	)
 	if err != nil {
 		return nil, err
@@ -923,9 +967,9 @@ func shouldRetryTask(task TransferTask) bool {
 
 	var retryDelay time.Duration
 	if task.RetryCount < 30 {
-		retryDelay = time.Duration(int64(retryBaseDelaySecs) * int64(1<<task.RetryCount)) * time.Second
+		retryDelay = time.Duration(int64(retryBaseDelaySecs)*int64(1<<task.RetryCount)) * time.Second
 	} else {
-		retryDelay = time.Duration(int64(retryBaseDelaySecs) * 1073741824) * time.Second
+		retryDelay = time.Duration(int64(retryBaseDelaySecs)*1073741824) * time.Second
 	}
 
 	if time.Now().After(lastRetryTime.Add(retryDelay)) {

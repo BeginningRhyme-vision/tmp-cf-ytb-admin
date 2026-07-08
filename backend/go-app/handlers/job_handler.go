@@ -259,10 +259,10 @@ func RetryTransferTasksLogic(jobID int, initialStatus models.JobStatus) {
 // 【旧逻辑】保持原样，专门处理旧任务
 // 【新逻辑】处理分片任务
 
-// resetFailedTaskForRetry resets a FAILED task to PENDING state for retry.
+// resetFailedTaskForRetry resets a FAILED task to PENDING state for MANUAL retry
+// (triggered by Retry Failed button). RetryCount and LastRetryTime are reset to 0
+// so the task gets a fresh start with base timeout (1x multiplier).
 // Returns true if the task was reset, false if it was not in FAILED state.
-// This is the single source of truth for task reset logic used by both
-// sharded and legacy retry paths, as well as the /transfer-tasks/reset API.
 func resetFailedTaskForRetry(task *models.TransferTask) bool {
 	if task.Status != "FAILED" {
 		return false
@@ -276,6 +276,19 @@ func resetFailedTaskForRetry(task *models.TransferTask) bool {
 	task.RetryCount = 0
 	task.LastRetryTime = ""
 	return true
+}
+
+// resetTaskForAutoRetry resets a FAILED task to PENDING state for AUTO retry
+// (triggered by retry scanner). RetryCount and LastRetryTime are PRESERVED so
+// the retry count can accumulate towards maxRetryCount, at which point the task
+// is permanently marked as FAILED and stops being retried automatically.
+func resetTaskForAutoRetry(task *models.TransferTask, newStatus string) {
+	task.Status = newStatus
+	task.UpdatedAt = time.Now()
+	task.ErrorMessage = ""
+	task.WorkerID = ""
+	task.StartedAt = time.Time{}
+	task.CompletedAt = time.Time{}
 }
 
 func retryShardedTransferTasks(ctx context.Context, jobID int, initialStatus models.JobStatus) {

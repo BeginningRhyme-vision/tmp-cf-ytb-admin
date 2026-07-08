@@ -2309,12 +2309,7 @@ func ResetTransferTask(c *gin.Context) {
 			continue
 		}
 
-		task.Status = req.Status
-		task.WorkerID = ""
-		task.StartedAt = time.Time{}
-		task.CompletedAt = time.Time{}
-		task.ErrorMessage = ""
-		task.UpdatedAt = time.Now()
+		resetTaskForAutoRetry(&task, req.Status)
 
 		data, err := json.Marshal(task)
 		if err != nil {

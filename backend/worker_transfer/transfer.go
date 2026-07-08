@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -88,6 +90,39 @@ var (
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 	shutdownWg     sync.WaitGroup
+
+	// Adaptive Concurrency Control
+	adaptiveConcurrencyEnabled         bool
+	minWorkers                         int
+	maxWorkers                         int
+	concurrencyIncreaseStep            int
+	concurrencyDecreaseFactor          float64
+	errorRateThreshold                 float64
+	avgLatencyThresholdMS              int
+	connPoolUtilizationThreshold       float64
+	concurrencyAdjustIntervalSecs      int
+	concurrencyCooldownSecs            int
+	maxLatencySamples                  int
+
+	effectiveWorkerCount       int32
+	effectivePartConcurrency   int32
+	activeWorkerCount          int32
+
+	// Performance metrics for adaptive control
+	recentLatencies         *list.List
+	recentLatenciesMutex    sync.Mutex
+	recentErrors            int32
+	recentTotal             int32
+	currentConnPoolUtilization float64
+
+	// Sliding window metrics
+	windowErrors            int32
+	windowTotal             int32
+	windowMutex             sync.Mutex
+
+	// Cooldown tracking
+	lastDecreaseTime        time.Time
+	lastDecreaseTimeMutex   sync.Mutex
 
 	// Metrics
 	BytesTransferred = promauto.NewCounter(prometheus.CounterOpts{
@@ -162,6 +197,17 @@ const (
 	DefaultMaxTimeoutSecs           = 10800
 	DefaultMinThroughputMBPS        = 2
 	DefaultChunkReadTimeoutSecs     = 30
+
+	DefaultAdaptiveConcurrencyEnabled     = true
+	DefaultMinWorkers                     = 8
+	DefaultConcurrencyIncreaseStep        = 1
+	DefaultConcurrencyDecreaseFactor      = 0.5
+	DefaultErrorRateThreshold             = 0.05
+	DefaultAvgLatencyThresholdMS          = 2000
+	DefaultConnPoolUtilizationThreshold   = 0.8
+	DefaultConcurrencyAdjustIntervalSecs  = 10
+	DefaultConcurrencyCooldownSecs        = 30
+	DefaultMaxLatencySamples              = 500
 )
 
 func runTransfer() {
@@ -200,6 +246,29 @@ func runTransfer() {
 	maxTimeoutSecs = getEnvInt("TRANSFER_MAX_TIMEOUT_SECS", DefaultMaxTimeoutSecs)
 	minThroughputMBPS = getEnvInt("TRANSFER_MIN_THROUGHPUT_MBPS", DefaultMinThroughputMBPS)
 	chunkReadTimeoutSecs = getEnvInt("TRANSFER_CHUNK_READ_TIMEOUT_SECS", DefaultChunkReadTimeoutSecs)
+
+	// Adaptive Concurrency Control Configuration
+	adaptiveConcurrencyEnabled = getEnvBool("TRANSFER_ADAPTIVE_CONCURRENCY_ENABLED", DefaultAdaptiveConcurrencyEnabled)
+	minWorkers = getEnvInt("TRANSFER_MIN_WORKERS", DefaultMinWorkers)
+	maxWorkers = workerCount
+	concurrencyIncreaseStep = getEnvInt("TRANSFER_CONCURRENCY_INCREASE_STEP", DefaultConcurrencyIncreaseStep)
+	concurrencyDecreaseFactor = getEnvFloat("TRANSFER_CONCURRENCY_DECREASE_FACTOR", DefaultConcurrencyDecreaseFactor)
+	errorRateThreshold = getEnvFloat("TRANSFER_ERROR_RATE_THRESHOLD", DefaultErrorRateThreshold)
+	avgLatencyThresholdMS = getEnvInt("TRANSFER_AVG_LATENCY_THRESHOLD_MS", DefaultAvgLatencyThresholdMS)
+	connPoolUtilizationThreshold = getEnvFloat("TRANSFER_CONN_POOL_UTILIZATION_THRESHOLD", DefaultConnPoolUtilizationThreshold)
+	concurrencyAdjustIntervalSecs = getEnvInt("TRANSFER_CONCURRENCY_ADJUST_INTERVAL_SECS", DefaultConcurrencyAdjustIntervalSecs)
+	concurrencyCooldownSecs = getEnvInt("TRANSFER_CONCURRENCY_COOLDOWN_SECS", DefaultConcurrencyCooldownSecs)
+	maxLatencySamples = getEnvInt("TRANSFER_MAX_LATENCY_SAMPLES", DefaultMaxLatencySamples)
+
+	if minWorkers > maxWorkers {
+		minWorkers = maxWorkers
+	}
+
+	atomic.StoreInt32(&effectiveWorkerCount, int32(maxWorkers))
+	atomic.StoreInt32(&effectivePartConcurrency, int32(partConcurrency))
+	recentLatencies = list.New()
+	lastDecreaseTime = time.Unix(0, 0)
+
 	httpClient = &http.Client{
 		Timeout: 20 * time.Second,
 		Transport: &http.Transport{
@@ -283,6 +352,13 @@ func runTransfer() {
 		}
 	}()
 
+	// Start Adaptive Concurrency Controller
+	if adaptiveConcurrencyEnabled {
+		go startConcurrencyController()
+		log.Printf("Adaptive concurrency control enabled: min=%d, max=%d, interval=%ds",
+			minWorkers, maxWorkers, concurrencyAdjustIntervalSecs)
+	}
+
 	// Start Workers
 	var wg sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
@@ -290,7 +366,13 @@ func runTransfer() {
 		go func() {
 			defer wg.Done()
 			for t := range taskChan {
+				if !acquireWorkerSlot() {
+					time.Sleep(100 * time.Millisecond)
+					taskChan <- t
+					continue
+				}
 				processTask(t)
+				releaseWorkerSlot()
 			}
 		}()
 	}
@@ -328,6 +410,289 @@ func calculateDynamicTimeout(size int64) time.Duration {
 
 func calculatePartTimeout(partSize int64) time.Duration {
 	return calculateDynamicTimeout(partSize)
+}
+
+func acquireWorkerSlot() bool {
+	if !adaptiveConcurrencyEnabled {
+		return true
+	}
+	active := atomic.AddInt32(&activeWorkerCount, 1)
+	effective := atomic.LoadInt32(&effectiveWorkerCount)
+	defer func() {
+		if !isWorkerSlotAvailable(active) {
+			atomic.AddInt32(&activeWorkerCount, -1)
+			log.Printf("[Adaptive] Worker slot REJECTED: active=%d, effective=%d (capped at max=%d)", active, effective, maxWorkers)
+		}
+	}()
+	if active <= effective {
+		log.Printf("[Adaptive] Worker slot ACQUIRED: active=%d, effective=%d, max=%d", active, effective, maxWorkers)
+		return true
+	}
+	return false
+}
+
+func isWorkerSlotAvailable(active int32) bool {
+	effective := atomic.LoadInt32(&effectiveWorkerCount)
+	return active <= effective
+}
+
+func releaseWorkerSlot() {
+	if adaptiveConcurrencyEnabled {
+		active := atomic.AddInt32(&activeWorkerCount, -1)
+		log.Printf("[Adaptive] Worker slot RELEASED: active=%d, effective=%d", active, atomic.LoadInt32(&effectiveWorkerCount))
+	}
+}
+
+func acquirePartSlot(sem chan struct{}) bool {
+	if !adaptiveConcurrencyEnabled {
+		sem <- struct{}{}
+		return true
+	}
+	effective := atomic.LoadInt32(&effectivePartConcurrency)
+	if effective <= 0 {
+		log.Printf("[Adaptive] Part slot REJECTED: effective=%d (disabled)", effective)
+		return false
+	}
+	select {
+	case sem <- struct{}{}:
+		log.Printf("[Adaptive] Part slot ACQUIRED: effective=%d", effective)
+		return true
+	default:
+		select {
+		case sem <- struct{}{}:
+			log.Printf("[Adaptive] Part slot ACQUIRED (delayed): effective=%d", effective)
+			return true
+		default:
+			log.Printf("[Adaptive] Part slot REJECTED: semaphore full, effective=%d", effective)
+			return false
+		}
+	}
+}
+
+func recordTransferLatency(latencyMs int64) {
+	if !adaptiveConcurrencyEnabled {
+		return
+	}
+	recentLatenciesMutex.Lock()
+	defer recentLatenciesMutex.Unlock()
+
+	recentLatencies.PushBack(latencyMs)
+	for recentLatencies.Len() > maxLatencySamples {
+		recentLatencies.Remove(recentLatencies.Front())
+	}
+	log.Printf("[Adaptive] Latency recorded: %dms, total samples=%d (max=%d)", latencyMs, recentLatencies.Len(), maxLatencySamples)
+}
+
+func recordTransferResult(success bool) {
+	if !adaptiveConcurrencyEnabled {
+		return
+	}
+
+	total := atomic.AddInt32(&recentTotal, 1)
+	var errors int32
+	if !success {
+		errors = atomic.AddInt32(&recentErrors, 1)
+	}
+
+	windowMutex.Lock()
+	atomic.AddInt32(&windowTotal, 1)
+	if !success {
+		atomic.AddInt32(&windowErrors, 1)
+	}
+	windowMutex.Unlock()
+
+	log.Printf("[Adaptive] Transfer result recorded: success=%v, total=%d, errors=%d, errorRate=%.2f%%",
+		success, total, errors, float64(errors)/float64(total)*100)
+}
+
+func getErrorRate() float64 {
+	total := atomic.LoadInt32(&windowTotal)
+	if total == 0 {
+		return 0
+	}
+	errors := atomic.LoadInt32(&windowErrors)
+	return float64(errors) / float64(total)
+}
+
+func getAvgLatencyMs() float64 {
+	recentLatenciesMutex.Lock()
+	defer recentLatenciesMutex.Unlock()
+
+	if recentLatencies.Len() == 0 {
+		return 0
+	}
+
+	var sum int64 = 0
+	for e := recentLatencies.Front(); e != nil; e = e.Next() {
+		sum += e.Value.(int64)
+	}
+	return float64(sum) / float64(recentLatencies.Len())
+}
+
+func getConnPoolUtilization() float64 {
+	return currentConnPoolUtilization
+}
+
+func startConcurrencyController() {
+	shutdownWg.Add(1)
+	defer shutdownWg.Done()
+
+	ticker := time.NewTicker(time.Duration(concurrencyAdjustIntervalSecs) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-shutdownCtx.Done():
+			log.Println("Concurrency controller stopping...")
+			return
+		case <-ticker.C:
+			adjustConcurrency()
+		}
+	}
+}
+
+func adjustConcurrency() {
+	errorRate := getErrorRate()
+	avgLatency := getAvgLatencyMs()
+	connPoolUtil := getConnPoolUtilization()
+	currentEffective := atomic.LoadInt32(&effectiveWorkerCount)
+	currentActive := atomic.LoadInt32(&activeWorkerCount)
+
+	log.Printf("[Adaptive] ===== Concurrency Adjustment Check =====]")
+	log.Printf("[Adaptive] Current state: effective=%d, active=%d, min=%d, max=%d",
+		currentEffective, currentActive, minWorkers, maxWorkers)
+	log.Printf("[Adaptive] Metrics: errorRate=%.2f%%, latency=%.0fms, connPool=%.2f",
+		errorRate*100, avgLatency, connPoolUtil)
+	log.Printf("[Adaptive] Thresholds: errorRate=%.2f%%, latency=%dms, connPool=%.2f",
+		errorRateThreshold*100, avgLatencyThresholdMS, connPoolUtilizationThreshold)
+
+	triggerReasons := []string{}
+	shouldDecrease := false
+
+	if errorRate > errorRateThreshold {
+		reason := fmt.Sprintf("error_rate(%.2f%%>%.2f%%)", errorRate*100, errorRateThreshold*100)
+		triggerReasons = append(triggerReasons, reason)
+		log.Printf("[Adaptive] DECREASE TRIGGER: %s", reason)
+		shouldDecrease = true
+	}
+	if avgLatency > float64(avgLatencyThresholdMS) {
+		reason := fmt.Sprintf("latency(%.0fms>%dms)", avgLatency, avgLatencyThresholdMS)
+		triggerReasons = append(triggerReasons, reason)
+		log.Printf("[Adaptive] DECREASE TRIGGER: %s", reason)
+		shouldDecrease = true
+	}
+	if connPoolUtil > connPoolUtilizationThreshold {
+		reason := fmt.Sprintf("conn_pool(%.2f>%.2f)", connPoolUtil, connPoolUtilizationThreshold)
+		triggerReasons = append(triggerReasons, reason)
+		log.Printf("[Adaptive] DECREASE TRIGGER: %s", reason)
+		shouldDecrease = true
+	}
+
+	lastDecreaseTimeMutex.Lock()
+	timeSinceLastDecrease := time.Since(lastDecreaseTime).Seconds()
+	lastDecreaseTimeMutex.Unlock()
+
+	if shouldDecrease {
+		if timeSinceLastDecrease < float64(concurrencyCooldownSecs) {
+			log.Printf("[Adaptive] *** COOLDOWN PERIOD ACTIVE ***")
+			log.Printf("[Adaptive] Last decrease was %.0fs ago, cooldown period is %ds",
+				timeSinceLastDecrease, concurrencyCooldownSecs)
+			log.Printf("[Adaptive] Skipping decrease, still in cooldown")
+			log.Printf("[Adaptive] ===== End Concurrency Adjustment =====]")
+			return
+		}
+
+		decreaseFactor := concurrencyDecreaseFactor
+		if len(triggerReasons) >= 2 {
+			decreaseFactor = 0.4
+			log.Printf("[Adaptive] Multiple triggers (%d), using more aggressive decrease factor: %.2f",
+				len(triggerReasons), decreaseFactor)
+		}
+
+		newEffective := int32(float64(currentEffective) * decreaseFactor)
+		if newEffective < int32(minWorkers) {
+			newEffective = int32(minWorkers)
+		}
+
+		if newEffective != currentEffective {
+			lastDecreaseTimeMutex.Lock()
+			lastDecreaseTime = time.Now()
+			lastDecreaseTimeMutex.Unlock()
+
+			log.Printf("[Adaptive] *** CONCURRENCY DECREASE TRIGGERED ***")
+			log.Printf("[Adaptive] Trigger reasons: %s", strings.Join(triggerReasons, ", "))
+			log.Printf("[Adaptive] Decreasing effective workers: %d -> %d (factor=%.2f)",
+				currentEffective, newEffective, decreaseFactor)
+
+			oldPartConcurrency := atomic.LoadInt32(&effectivePartConcurrency)
+			newPartConcurrency := int32(float64(partConcurrency) * decreaseFactor)
+			if newPartConcurrency < 1 {
+				newPartConcurrency = 1
+			}
+			atomic.StoreInt32(&effectiveWorkerCount, newEffective)
+			atomic.StoreInt32(&effectivePartConcurrency, newPartConcurrency)
+
+			log.Printf("[Adaptive] Part concurrency adjusted: %d -> %d", oldPartConcurrency, newPartConcurrency)
+			log.Printf("[Adaptive] Minimum workers boundary: %d", minWorkers)
+			log.Printf("[Adaptive] Cooldown period started: %ds", concurrencyCooldownSecs)
+		} else {
+			log.Printf("[Adaptive] No change needed: already at minimum effective workers=%d", currentEffective)
+			log.Printf("[Adaptive] Trigger conditions met but cannot decrease further (at min=%d)", minWorkers)
+		}
+	} else {
+		if currentEffective < int32(maxWorkers) {
+			increaseStep := concurrencyIncreaseStep
+			if timeSinceLastDecrease < float64(concurrencyCooldownSecs) {
+				log.Printf("[Adaptive] Still in cooldown period (%.0fs remaining), slower recovery",
+					timeSinceLastDecrease)
+				increaseStep = 1
+			} else if currentEffective < int32(maxWorkers)*2/3 {
+				increaseStep = concurrencyIncreaseStep * 2
+				log.Printf("[Adaptive] Below 2/3 of max workers, accelerated recovery: step=%d", increaseStep)
+			}
+
+			newEffective := currentEffective + int32(increaseStep)
+			if newEffective > int32(maxWorkers) {
+				newEffective = int32(maxWorkers)
+			}
+
+			if newEffective != currentEffective {
+				log.Printf("[Adaptive] *** CONCURRENCY INCREASE ***")
+				log.Printf("[Adaptive] All conditions within thresholds, increasing effective workers: %d -> %d (step=%d)",
+					currentEffective, newEffective, increaseStep)
+
+				oldPartConcurrency := atomic.LoadInt32(&effectivePartConcurrency)
+				newPartConcurrency := int32(float64(partConcurrency)*(float64(newEffective)/float64(maxWorkers)) + 0.5)
+				if newPartConcurrency < 1 {
+					newPartConcurrency = 1
+				}
+				atomic.StoreInt32(&effectiveWorkerCount, newEffective)
+				atomic.StoreInt32(&effectivePartConcurrency, newPartConcurrency)
+
+				log.Printf("[Adaptive] Part concurrency adjusted: %d -> %d", oldPartConcurrency, newPartConcurrency)
+				log.Printf("[Adaptive] Max workers: %d", maxWorkers)
+			} else {
+				log.Printf("[Adaptive] No change needed: already at maximum effective workers=%d", currentEffective)
+			}
+		} else {
+			log.Printf("[Adaptive] No change: at maximum effective workers=%d", currentEffective)
+			log.Printf("[Adaptive] All metrics healthy: errorRate=%.2f%%, avgLatency=%.0fms, connPoolUtil=%.2f",
+				errorRate*100, avgLatency, connPoolUtil)
+		}
+	}
+
+	log.Printf("[Adaptive] ===== End Concurrency Adjustment =====]")
+
+	windowMutex.Lock()
+	windowTotal = 0
+	windowErrors = 0
+	windowMutex.Unlock()
+
+	atomic.StoreInt32(&recentTotal, 0)
+	atomic.StoreInt32(&recentErrors, 0)
+	recentLatenciesMutex.Lock()
+	recentLatencies.Init()
+	recentLatenciesMutex.Unlock()
 }
 
 func validateTimeoutConfig(min, max, throughput int) bool {
@@ -421,6 +786,7 @@ func updateConnPoolMetrics() {
 	if maxConns > 0 {
 		usage := float64(active) / float64(maxConns)
 		ConnPoolUsageGauge.WithLabelValues("transfer").Set(usage)
+		currentConnPoolUtilization = usage
 	}
 }
 
@@ -496,6 +862,7 @@ func processTask(t TransferTask) {
 		updateTaskStatusWithRetry(t, "FAILED", err.Error())
 		updateJobStats(t.JobID, 0, 1)
 		TasksTransferred.WithLabelValues("failed").Inc()
+		recordTransferResult(false)
 		return
 	}
 
@@ -516,6 +883,7 @@ func processTask(t TransferTask) {
 		updateTaskStatusWithRetry(t, "FAILED", "Dst client init failed")
 		updateJobStats(t.JobID, 0, 1)
 		TasksTransferred.WithLabelValues("failed").Inc()
+		recordTransferResult(false)
 		return
 	}
 
@@ -560,6 +928,7 @@ func processTask(t TransferTask) {
 			updateTaskStatusWithRetry(t, "FAILED", "HeadObject failed: "+err.Error())
 			updateJobStats(t.JobID, 0, 1)
 			TasksTransferred.WithLabelValues("failed").Inc()
+			recordTransferResult(false)
 			return
 		}
 		size = *head.ContentLength
@@ -572,6 +941,7 @@ func processTask(t TransferTask) {
 		updateTaskStatusWithRetry(t, "FAILED", "Construct Src URL failed")
 		updateJobStats(t.JobID, 0, 1)
 		TasksTransferred.WithLabelValues("failed").Inc()
+		recordTransferResult(false)
 		return
 	}
 
@@ -590,6 +960,7 @@ func processTask(t TransferTask) {
 		updateTaskStatusWithRetry(t, "FAILED", err.Error())
 		updateJobStats(t.JobID, 0, 1)
 		TasksTransferred.WithLabelValues("failed").Inc()
+		recordTransferResult(false)
 	} else {
 		log.Printf("Task %d completed successfully", t.ID)
 
@@ -615,6 +986,8 @@ func processTask(t TransferTask) {
 		TransferDuration.Observe(duration)
 		BytesTransferred.Add(float64(size))
 		TasksTransferred.WithLabelValues("success").Inc()
+		recordTransferResult(true)
+		recordTransferLatency(int64(duration * 1000))
 	}
 }
 
@@ -661,7 +1034,9 @@ func transferFile(ctx context.Context, srcURL string, dstClient *s3.Client, dstB
 		wg.Add(1)
 		go func(pNum int32, s, e int64) {
 			defer wg.Done()
-			sem <- struct{}{}
+			if !acquirePartSlot(sem) {
+				return
+			}
 			defer func() { <-sem }()
 
 			partSizeBytes := e - s + 1
@@ -996,6 +1371,33 @@ func getEnvInt(key string, defaultValue int) int {
 		return defaultValue
 	}
 	return n
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultValue
+	}
+	switch strings.ToLower(v) {
+	case "true", "1", "yes", "on":
+		return true
+	case "false", "0", "no", "off":
+		return false
+	default:
+		return defaultValue
+	}
+}
+
+func getEnvFloat(key string, defaultValue float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultValue
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f <= 0 {
+		return defaultValue
+	}
+	return f
 }
 
 func updateTaskStatusWithRetry(t TransferTask, status, msg string) {

@@ -913,7 +913,25 @@ func processTask(t TransferTask) {
 	start := time.Now()
 
 	if t.RetryCount >= maxRetryCount {
-		log.Printf("Task %d has reached max retry count (%d), skipping", t.ID, maxRetryCount)
+		log.Printf("Task %d has reached max retry count (%d), marking as permanently FAILED", t.ID, maxRetryCount)
+		t.Status = "FAILED"
+		payload := map[string]interface{}{
+			"id":              t.ID,
+			"job_id":          t.JobID,
+			"status":          "FAILED",
+			"retry_count":     t.RetryCount,
+			"last_retry_time": t.LastRetryTime,
+		}
+		data, _ := json.Marshal([]map[string]interface{}{payload})
+		resp, err := httpClient.Post(apiBaseURL+"/transfer-tasks/update", "application/json", bytes.NewBuffer(data))
+		if err != nil {
+			log.Printf("Failed to update status for task %d (max retry): %v", t.ID, err)
+		} else {
+			resp.Body.Close()
+		}
+		updateJobStats(t.JobID, 0, 1)
+		TasksTransferred.WithLabelValues("failed").Inc()
+		recordTransferResult(false)
 		return
 	}
 

@@ -1,0 +1,243 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "title": "Connection Pool Active Connections",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "transfer_conn_pool_active{pool=\"transfer\"}",
+          "legendFormat": "Active",
+          "refId": "A"
+        },
+        {
+          "expr": "transfer_conn_pool_idle{pool=\"transfer\"}",
+          "legendFormat": "Idle",
+          "refId": "B"
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": "Connections",
+          "logBase": 1
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "title": "Connection Pool Usage (%)",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "transfer_conn_pool_usage{pool=\"transfer\"} * 100",
+          "legendFormat": "Usage",
+          "refId": "A"
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "percent",
+          "label": "Usage %",
+          "logBase": 1,
+          "max": 100,
+          "min": 0
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "title": "Bytes Transferred",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "rate(transfer_bytes_transferred_total[5m])",
+          "legendFormat": "Bytes/s",
+          "refId": "A"
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "bytes",
+          "label": "Bytes/sec",
+          "logBase": 1
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "title": "Tasks Processed",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "rate(transfer_tasks_transferred_total{status=\"success\"}[5m])",
+          "legendFormat": "Success",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(transfer_tasks_transferred_total{status=\"failed\"}[5m])",
+          "legendFormat": "Failed",
+          "refId": "B"
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": "Tasks/sec",
+          "logBase": 1
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "title": "Transfer Duration",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "avg(transfer_duration_seconds)",
+          "legendFormat": "Avg Duration",
+          "refId": "A"
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "s",
+          "label": "Seconds",
+          "logBase": 1
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "title": "Connection Wait Count",
+      "type": "graph",
+      "targets": [
+        {
+          "expr": "rate(transfer_conn_pool_wait_total{pool=\"transfer\"}[5m])",
+          "legendFormat": "Waits/sec",
+          "refId": "A"
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": "Waits/sec",
+          "logBase": 1
+        }
+      ]
+    },
+    {
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 24
+      },
+      "id": 7,
+      "title": "Total Active Connections",
+      "type": "singlestat",
+      "targets": [
+        {
+          "expr": "transfer_conn_pool_active{pool=\"transfer\"}",
+          "refId": "A"
+        }
+      ],
+      "valueName": "current"
+    },
+    {
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      },
+      "id": 8,
+      "title": "Connection Pool Usage %",
+      "type": "singlestat",
+      "targets": [
+        {
+          "expr": "transfer_conn_pool_usage{pool=\"transfer\"} * 100",
+          "refId": "A"
+        }
+      ],
+      "valueName": "current"
+    },
+    {
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 24
+      },
+      "id": 9,
+      "title": "Tasks/sec",
+      "type": "singlestat",
+      "targets": [
+        {
+          "expr": "rate(transfer_tasks_transferred_total[5m])",
+          "refId": "A"
+        }
+      ],
+      "valueName": "current"
+    }
+  ],
+  "schemaVersion": 26,
+  "style": "dark",
+  "tags": [],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Transfer Worker Connection Pool Dashboard",
+  "uid": "transfer-conn-pool",
+  "version": 1
+}

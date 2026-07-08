@@ -2096,36 +2096,59 @@ func AcquireTransferTasks(c *gin.Context) {
 		return
 	}
 
-	// Simple round robin or random
-	// Ideally verify Job Status is RUNNING here too, but buffer manager handles removal?
-	// Currently buffer manager doesn't remove keys from map if job stops.
-	// But `checkAndRefill` only checks active jobs.
-	// We might serve stale buffer for stopped jobs. Acceptable for now.
-
-	for _, jid := range jobIDs {
-		if len(tasks) >= req.Limit {
-			break
-		}
-
+	if len(jobIDs) == 1 {
 		bufferMutex.RLock()
-		ch, ok := txJobBuffers[jid]
+		ch, ok := txJobBuffers[jobIDs[0]]
 		bufferMutex.RUnlock()
-		if !ok {
-			continue
-		}
-
-		if len(ch) < BufferLowWater {
-			triggerTxRefill(jid)
-		}
-
-	loop:
-		for len(tasks) < req.Limit {
-			select {
-			case t := <-ch:
-				tasks = append(tasks, t)
-			default:
-				break loop
+		if ok {
+			for len(tasks) < req.Limit {
+				select {
+				case t := <-ch:
+					tasks = append(tasks, t)
+				default:
+					break
+				}
 			}
+		}
+		c.JSON(http.StatusOK, tasks)
+		return
+	}
+
+	maxPerJob := req.Limit / len(jobIDs)
+	if maxPerJob < 1 {
+		maxPerJob = 1
+	}
+
+	for len(tasks) < req.Limit {
+		gotAny := false
+		for _, jid := range jobIDs {
+			if len(tasks) >= req.Limit {
+				break
+			}
+
+			bufferMutex.RLock()
+			ch, ok := txJobBuffers[jid]
+			bufferMutex.RUnlock()
+			if !ok {
+				continue
+			}
+
+			if len(ch) < BufferLowWater {
+				triggerTxRefill(jid)
+			}
+
+			for i := 0; i < maxPerJob && len(tasks) < req.Limit; i++ {
+				select {
+				case t := <-ch:
+					tasks = append(tasks, t)
+					gotAny = true
+				default:
+					break
+				}
+			}
+		}
+		if !gotAny {
+			break
 		}
 	}
 	c.JSON(http.StatusOK, tasks)

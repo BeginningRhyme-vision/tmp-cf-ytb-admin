@@ -1761,11 +1761,23 @@ func checkAndRefillTxBuffers() {
 				}
 
 				// 判定逻辑：如果 Offset 已经跑到了 Total (甚至超过)，但 Pending 依然 > 0
-				// 说明 Offset 可能跑过头了或者中间有跳过，导致 Buffer 填不进数据
+				// 说明任务正在处理中（状态还没从 PENDING 更新），不应该重置 offset
+				// 重置 offset 会导致已处理的任务被重新读取，源文件可能已被删除，导致 404 错误
 				if total > 0 && offset >= total {
-					fmt.Printf("Resetting offset for stuck transfer job %d (Total/Max: %d, Offset: %d, Pending: %d)\n", jid, total, offset, job.PendingCount)
-					// 重置 Offset 重新扫描
-					database.RDB.Set(ctx, offsetKey, 0, 0)
+					// 检查是否有 RUNNING 状态的任务，如果有则说明任务正在处理中
+					var runningCount int64
+					database.DB.Model(&models.TransferTask{}).
+						Where("job_id = ? AND status = ?", jid, "RUNNING").
+						Count(&runningCount)
+
+					if runningCount > 0 {
+						fmt.Printf("Job %d: offset=%d reached total=%d, but %d tasks still RUNNING, skipping offset reset\n", jid, offset, total, runningCount)
+					} else {
+						// 没有 RUNNING 任务但有 PENDING 任务，可能真的卡住了
+						// 只在确认没有活跃任务时才重置，且只重置一次
+						fmt.Printf("Resetting offset for stuck transfer job %d (Total/Max: %d, Offset: %d, Pending: %d, Running: 0)\n", jid, total, offset, job.PendingCount)
+						database.RDB.Set(ctx, offsetKey, 0, 0)
+					}
 				}
 			}
 		}
@@ -2765,6 +2777,8 @@ func StartTransferJobMonitor() {
 }
 
 func updateCompletedTransferJobs() {
+	// 通过子查询检查是否有 PENDING 或 RUNNING 状态的任务
+	// 不依赖 pending_count/running_count 字段，因为它们可能因 stats 批量更新延迟而不准确
 	query := `
 		UPDATE transfer_jobs
 		SET
@@ -2779,9 +2793,12 @@ func updateCompletedTransferJobs() {
 		WHERE
 			status = ?
 			AND total_count > 0
-			AND pending_count = 0
 			AND periodic_interval = 0
 			AND last_scan_time IS NOT NULL
+			AND job_id NOT IN (
+				SELECT DISTINCT job_id FROM transfer_tasks
+				WHERE status IN ('PENDING', 'RUNNING')
+			)
 	`
 	result := database.DB.Exec(query, models.StatusCompleted, models.StatusRunning)
 	if result.Error != nil {

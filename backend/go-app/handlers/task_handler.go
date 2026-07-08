@@ -7,6 +7,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"regexp"
 	"strings"
@@ -2115,7 +2116,14 @@ func AcquireTransferTasks(c *gin.Context) {
 	}
 
 	maxPerJob := req.Limit / len(jobIDs)
-	if maxPerJob < 1 {
+	
+	if len(jobIDs) > req.Limit {
+		rand.Shuffle(len(jobIDs), func(i, j int) {
+			jobIDs[i], jobIDs[j] = jobIDs[j], jobIDs[i]
+		})
+		jobIDs = jobIDs[:req.Limit]
+		maxPerJob = 1
+	} else if maxPerJob < 1 {
 		maxPerJob = 1
 	}
 

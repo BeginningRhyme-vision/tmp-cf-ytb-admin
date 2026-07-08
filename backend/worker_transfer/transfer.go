@@ -91,11 +91,13 @@ var (
 
 const (
 	WorkerID                    = "go-transfer-1"
-	DefaultConcurrentWorkers    = 64
-	DefaultTaskBufferSize       = 128
+	DefaultConcurrentWorkers    = 128
+	DefaultTaskBufferSize       = 256
 	DefaultPartConcurrency      = 16
-	DefaultMultipartThresholdMB = 8
-	DefaultMinPartSizeMB        = 5
+	DefaultMultipartThresholdMB = 16
+	DefaultMinPartSizeMB        = 8
+	DefaultTransferTimeoutSecs  = 300
+	DefaultMaxConnections       = 2048
 )
 
 func runTransfer() {
@@ -116,6 +118,8 @@ func runTransfer() {
 	partConcurrency = getEnvInt("TRANSFER_PART_CONCURRENCY", DefaultPartConcurrency)
 	multipartThreshold = int64(getEnvInt("TRANSFER_MULTIPART_THRESHOLD_MB", DefaultMultipartThresholdMB)) * 1024 * 1024
 	minPartSize = int64(getEnvInt("TRANSFER_MIN_PART_SIZE_MB", DefaultMinPartSizeMB)) * 1024 * 1024
+	transferTimeoutSecs := getEnvInt("TRANSFER_TIMEOUT_SECS", DefaultTransferTimeoutSecs)
+	maxConnections := getEnvInt("TRANSFER_MAX_CONNECTIONS", DefaultMaxConnections)
 	httpClient = &http.Client{
 		Timeout: 20 * time.Second,
 		Transport: &http.Transport{
@@ -129,10 +133,10 @@ func runTransfer() {
 		},
 	}
 	transferClient = &http.Client{
-		Timeout: 60 * time.Second,
+		Timeout: time.Duration(transferTimeoutSecs) * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConns:        512,
-			MaxIdleConnsPerHost: 512,
+			MaxIdleConns:        maxConnections,
+			MaxIdleConnsPerHost: maxConnections,
 			IdleConnTimeout:     120 * time.Second,
 			DialContext: (&net.Dialer{
 				Timeout:   8 * time.Second,

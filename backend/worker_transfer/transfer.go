@@ -282,6 +282,13 @@ func runTransfer() {
 	maxLargeFiles = getEnvInt("TRANSFER_MAX_LARGE_FILES", DefaultMaxLargeFiles)
 	maxRetryLargeFiles = getEnvInt("TRANSFER_MAX_RETRY_LARGE_FILES", DefaultMaxRetryLargeFiles)
 
+	if maxLargeFiles < 1 {
+		maxLargeFiles = 1
+	}
+	if maxRetryLargeFiles < 1 {
+		maxRetryLargeFiles = 1
+	}
+
 	if minWorkers > maxWorkers {
 		minWorkers = maxWorkers
 	}

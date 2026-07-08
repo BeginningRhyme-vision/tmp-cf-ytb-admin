@@ -125,9 +125,11 @@ var (
 	lastDecreaseTimeMutex   sync.Mutex
 
 	// Log throttling - limit slot status logs to avoid spamming
-	lastSlotLogTime         time.Time
+	lastWorkerSlotLogTime   time.Time
+	workerSlotLogMutex      sync.Mutex
+	lastPartSlotLogTime     time.Time
+	partSlotLogMutex        sync.Mutex
 	slotLogThrottleSecs     int
-	slotLogMutex            sync.Mutex
 
 	// Large file concurrency control
 	largeFileThresholdBytes  int64
@@ -463,13 +465,13 @@ func acquireWorkerSlot() bool {
 	defer func() {
 		if !isWorkerSlotAvailable(active) {
 			atomic.AddInt32(&activeWorkerCount, -1)
-			if shouldLogSlotStatus() {
+			if shouldLogWorkerSlotStatus() {
 				log.Printf("[Adaptive] Worker slot REJECTED: active=%d, effective=%d (capped at max=%d)", active, effective, maxWorkers)
 			}
 		}
 	}()
 	if active <= effective {
-		if shouldLogSlotStatus() {
+		if shouldLogWorkerSlotStatus() {
 			log.Printf("[Adaptive] Worker slot ACQUIRED: active=%d, effective=%d, max=%d", active, effective, maxWorkers)
 		}
 		return true
@@ -484,8 +486,7 @@ func isWorkerSlotAvailable(active int32) bool {
 
 func releaseWorkerSlot() {
 	if adaptiveConcurrencyEnabled {
-		active := atomic.AddInt32(&activeWorkerCount, -1)
-		log.Printf("[Adaptive] Worker slot RELEASED: active=%d, effective=%d", active, atomic.LoadInt32(&effectiveWorkerCount))
+		atomic.AddInt32(&activeWorkerCount, -1)
 	}
 }
 
@@ -496,26 +497,26 @@ func acquirePartSlot(sem chan struct{}) bool {
 	}
 	effective := atomic.LoadInt32(&effectivePartConcurrency)
 	if effective <= 0 {
-		if shouldLogSlotStatus() {
+		if shouldLogPartSlotStatus() {
 			log.Printf("[Adaptive] Part slot REJECTED: effective=%d (disabled)", effective)
 		}
 		return false
 	}
 	select {
 	case sem <- struct{}{}:
-		if shouldLogSlotStatus() {
+		if shouldLogPartSlotStatus() {
 			log.Printf("[Adaptive] Part slot ACQUIRED: effective=%d", effective)
 		}
 		return true
 	default:
 		select {
 		case sem <- struct{}{}:
-			if shouldLogSlotStatus() {
+			if shouldLogPartSlotStatus() {
 				log.Printf("[Adaptive] Part slot ACQUIRED (delayed): effective=%d", effective)
 			}
 			return true
 		default:
-			if shouldLogSlotStatus() {
+			if shouldLogPartSlotStatus() {
 				log.Printf("[Adaptive] Part slot REJECTED: semaphore full, effective=%d", effective)
 			}
 			return false
@@ -523,12 +524,23 @@ func acquirePartSlot(sem chan struct{}) bool {
 	}
 }
 
-func shouldLogSlotStatus() bool {
-	slotLogMutex.Lock()
-	defer slotLogMutex.Unlock()
+func shouldLogWorkerSlotStatus() bool {
+	workerSlotLogMutex.Lock()
+	defer workerSlotLogMutex.Unlock()
 	now := time.Now()
-	if now.Sub(lastSlotLogTime).Seconds() >= float64(slotLogThrottleSecs) {
-		lastSlotLogTime = now
+	if now.Sub(lastWorkerSlotLogTime).Seconds() >= float64(slotLogThrottleSecs) {
+		lastWorkerSlotLogTime = now
+		return true
+	}
+	return false
+}
+
+func shouldLogPartSlotStatus() bool {
+	partSlotLogMutex.Lock()
+	defer partSlotLogMutex.Unlock()
+	now := time.Now()
+	if now.Sub(lastPartSlotLogTime).Seconds() >= float64(slotLogThrottleSecs) {
+		lastPartSlotLogTime = now
 		return true
 	}
 	return false

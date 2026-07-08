@@ -2778,6 +2778,7 @@ func updateCompletedTransferJobs() {
 			END
 		WHERE
 			status = ?
+			AND total_count > 0
 			AND pending_count = 0
 			AND periodic_interval = 0
 			AND last_scan_time IS NOT NULL

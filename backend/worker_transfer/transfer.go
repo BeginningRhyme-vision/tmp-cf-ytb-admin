@@ -276,7 +276,7 @@ func runTransfer() {
 	concurrencyAdjustIntervalSecs = getEnvInt("TRANSFER_CONCURRENCY_ADJUST_INTERVAL_SECS", DefaultConcurrencyAdjustIntervalSecs)
 	concurrencyCooldownSecs = getEnvInt("TRANSFER_CONCURRENCY_COOLDOWN_SECS", DefaultConcurrencyCooldownSecs)
 	maxLatencySamples = getEnvInt("TRANSFER_MAX_LATENCY_SAMPLES", DefaultMaxLatencySamples)
-	slotLogThrottleSecs = getEnvInt("TRANSFER_SLOT_LOG_THROTTLE_SECS", 15)
+	slotLogThrottleSecs = getEnvInt("TRANSFER_SLOT_LOG_THROTTLE_SECS", 20)
 
 	largeFileThresholdBytes = int64(getEnvInt("TRANSFER_LARGE_FILE_THRESHOLD_MB", DefaultLargeFileThresholdMB)) * 1024 * 1024
 	maxLargeFiles = getEnvInt("TRANSFER_MAX_LARGE_FILES", DefaultMaxLargeFiles)
@@ -463,11 +463,15 @@ func acquireWorkerSlot() bool {
 	defer func() {
 		if !isWorkerSlotAvailable(active) {
 			atomic.AddInt32(&activeWorkerCount, -1)
-			log.Printf("[Adaptive] Worker slot REJECTED: active=%d, effective=%d (capped at max=%d)", active, effective, maxWorkers)
+			if shouldLogSlotStatus() {
+				log.Printf("[Adaptive] Worker slot REJECTED: active=%d, effective=%d (capped at max=%d)", active, effective, maxWorkers)
+			}
 		}
 	}()
 	if active <= effective {
-		log.Printf("[Adaptive] Worker slot ACQUIRED: active=%d, effective=%d, max=%d", active, effective, maxWorkers)
+		if shouldLogSlotStatus() {
+			log.Printf("[Adaptive] Worker slot ACQUIRED: active=%d, effective=%d, max=%d", active, effective, maxWorkers)
+		}
 		return true
 	}
 	return false

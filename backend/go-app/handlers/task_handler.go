@@ -218,7 +218,7 @@ func flushStats() {
 				failed_count = GREATEST(0, failed_count + ?),
 				status = CASE 
 					WHEN status = 'PENDING' AND (GREATEST(0, running_count + ?)) > 0 THEN 'RUNNING'
-					WHEN status = 'RUNNING' AND (GREATEST(0, pending_count + ?)) <= 0 AND (GREATEST(0, running_count + ?)) <= 0 THEN 'COMPLETED'
+					WHEN status = 'RUNNING' AND (GREATEST(0, pending_count + ?)) <= 0 AND (GREATEST(0, running_count + ?)) <= 0 AND success_count + failed_count + ? + ? > 0 THEN 'COMPLETED'
 					ELSE status 
 				END
 			WHERE id = ?
@@ -227,6 +227,7 @@ func flushStats() {
 			delta.Pending, delta.Running, delta.Success, delta.Failed, // For count updates
 			delta.Running,                // For PENDING->RUNNING check
 			delta.Pending, delta.Running, // For RUNNING->COMPLETED check
+			delta.Success, delta.Failed,  // For total_count > 0 check
 			jobID,
 		)
 	}
@@ -1578,6 +1579,14 @@ func addShardedTransferTasks(jobID int64, inputs []TransferTaskInput) (int, erro
 			UpdateColumn("total_size_bytes", gorm.Expr("total_size_bytes + ?", totalSizeBytes))
 	}
 
+	if len(newInputs) > 0 {
+		database.DB.Model(&models.TransferJob{}).Where("job_id = ?", jobID).
+			Updates(map[string]interface{}{
+				"total_count":   gorm.Expr("total_count + ?", len(newInputs)),
+				"pending_count": gorm.Expr("pending_count + ?", len(newInputs)),
+			})
+	}
+
 	return len(tasks), nil
 }
 
@@ -1685,6 +1694,14 @@ func addLegacyTransferTasks(jobID int64, inputs []TransferTaskInput) (int, error
 	if totalSizeBytes > 0 {
 		database.DB.Model(&models.TransferJob{}).Where("job_id = ?", jobID).
 			UpdateColumn("total_size_bytes", gorm.Expr("total_size_bytes + ?", totalSizeBytes))
+	}
+
+	if len(newInputs) > 0 {
+		database.DB.Model(&models.TransferJob{}).Where("job_id = ?", jobID).
+			Updates(map[string]interface{}{
+				"total_count":   gorm.Expr("total_count + ?", len(newInputs)),
+				"pending_count": gorm.Expr("pending_count + ?", len(newInputs)),
+			})
 	}
 
 	return len(tasks), nil

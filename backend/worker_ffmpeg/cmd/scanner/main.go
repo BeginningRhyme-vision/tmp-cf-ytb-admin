@@ -38,6 +38,7 @@ var (
 	taskQueue  string
 	failedQueue string
 	dedupPrefix string
+	httpClient *http.Client
 	permFailureKey string
 	providerGuard string
 	requirePrivateEndpoint bool
@@ -131,6 +132,10 @@ func main() {
 
 	initRedis()
 
+	httpClient = &http.Client{
+		Timeout: 20 * time.Second,
+	}
+
 	// Start the retry manager in a separate goroutine
 	go startRetryManager()
 
@@ -210,7 +215,7 @@ func reportResultPatch(jobID int64, success bool) {
 	reqObj, _ := http.NewRequest("PATCH", fmt.Sprintf("%s/ffmpeg-jobs/%d/status", apiBaseURL, jobID), bytes.NewBuffer(data))
 	reqObj.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(reqObj)
+	resp, err := httpClient.Do(reqObj)
 	if err != nil {
 		log.Printf("Failed to report result for job %d: %v", jobID, err)
 		return
@@ -237,7 +242,7 @@ func initRedis() {
 }
 
 func getPendingJobs() ([]common.FfmpegJob, error) {
-	resp, err := http.Get(apiBaseURL + "/ffmpeg-jobs/pending")
+	resp, err := httpClient.Get(apiBaseURL + "/ffmpeg-jobs/pending")
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +326,7 @@ func updateJobStatus(jobID int64, status string, lastScanTime *time.Time, msg st
 	reqObj, _ := http.NewRequest("PATCH", fmt.Sprintf("%s/ffmpeg-jobs/%d/status", apiBaseURL, jobID), bytes.NewBuffer(data))
 	reqObj.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(reqObj)
+	resp, err := httpClient.Do(reqObj)
 	if err != nil {
 		return err
 	}

@@ -377,7 +377,7 @@ func sendBatch(jobID uint, tasks []TransferTaskInput) error {
 		"tasks": tasks,
 	}
 	data, _ := json.Marshal(payload)
-	resp, err := http.Post(fmt.Sprintf("%s/jobs/%d/tasks", apiBaseURL, jobID), "application/json", bytes.NewBuffer(data))
+	resp, err := httpClient.Post(fmt.Sprintf("%s/jobs/%d/tasks", apiBaseURL, jobID), "application/json", bytes.NewBuffer(data))
 	if err != nil {
 		return err
 	}

@@ -78,6 +78,15 @@ func runScanner() {
 
 	log.Println("Scanner Worker Started")
 
+	httpClient = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     30 * time.Second,
+		},
+	}
+
 	var activeJobs sync.Map
 
 	for {

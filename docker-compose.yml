@@ -167,6 +167,9 @@ services:
       - TRANSFER_MIN_PART_SIZE_MB=8
       - TRANSFER_TIMEOUT_SECS=300
       - TRANSFER_MAX_CONNECTIONS=2048
+      - TRANSFER_MAX_RETRY_COUNT=3
+      - TRANSFER_RETRY_BASE_DELAY_SECS=60
+      - TRANSFER_RETRY_SCANNER_INTERVAL_SECS=30
     volumes:
       - ./config/config.yaml:/app/config.yaml
     depends_on:

@@ -31,11 +31,13 @@ import (
 // 2. Transfer using external service
 
 type TransferTask struct {
-	ID     int64  `json:"id"`
-	JobID  int64  `json:"job_id"`
-	Src    string `json:"src"`
-	Size   int64  `json:"size"`
-	Status string `json:"status"`
+	ID            int64  `json:"id"`
+	JobID         int64  `json:"job_id"`
+	Src           string `json:"src"`
+	Size          int64  `json:"size"`
+	Status        string `json:"status"`
+	RetryCount    int    `json:"retry_count"`
+	LastRetryTime string `json:"last_retry_time"`
 }
 
 type JobInfo struct {
@@ -65,6 +67,9 @@ var (
 	partConcurrency    int
 	multipartThreshold int64
 	minPartSize        int64
+	maxRetryCount      int
+	retryBaseDelaySecs int
+	retryScannerIntervalSecs int
 
 	s3Clients sync.Map // Endpoint -> *s3.Client (Cache for Destinations)
 	srcClient *s3.Client
@@ -87,17 +92,25 @@ var (
 		Name: "transfer_duration_seconds",
 		Help: "Duration of transfers",
 	})
+
+	TaskRetries = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "transfer_task_retries_total",
+		Help: "Total number of task retries",
+	})
 )
 
 const (
-	WorkerID                    = "go-transfer-1"
-	DefaultConcurrentWorkers    = 128
-	DefaultTaskBufferSize       = 256
-	DefaultPartConcurrency      = 16
-	DefaultMultipartThresholdMB = 16
-	DefaultMinPartSizeMB        = 8
-	DefaultTransferTimeoutSecs  = 300
-	DefaultMaxConnections       = 2048
+	WorkerID                        = "go-transfer-1"
+	DefaultConcurrentWorkers        = 128
+	DefaultTaskBufferSize           = 256
+	DefaultPartConcurrency          = 16
+	DefaultMultipartThresholdMB     = 16
+	DefaultMinPartSizeMB            = 8
+	DefaultTransferTimeoutSecs      = 300
+	DefaultMaxConnections           = 2048
+	DefaultMaxRetryCount            = 3
+	DefaultRetryBaseDelaySecs       = 60
+	DefaultRetryScannerIntervalSecs = 30
 )
 
 func runTransfer() {
@@ -120,6 +133,9 @@ func runTransfer() {
 	minPartSize = int64(getEnvInt("TRANSFER_MIN_PART_SIZE_MB", DefaultMinPartSizeMB)) * 1024 * 1024
 	transferTimeoutSecs := getEnvInt("TRANSFER_TIMEOUT_SECS", DefaultTransferTimeoutSecs)
 	maxConnections := getEnvInt("TRANSFER_MAX_CONNECTIONS", DefaultMaxConnections)
+	maxRetryCount = getEnvInt("TRANSFER_MAX_RETRY_COUNT", DefaultMaxRetryCount)
+	retryBaseDelaySecs = getEnvInt("TRANSFER_RETRY_BASE_DELAY_SECS", DefaultRetryBaseDelaySecs)
+	retryScannerIntervalSecs = getEnvInt("TRANSFER_RETRY_SCANNER_INTERVAL_SECS", DefaultRetryScannerIntervalSecs)
 	httpClient = &http.Client{
 		Timeout: 20 * time.Second,
 		Transport: &http.Transport{
@@ -191,6 +207,10 @@ func runTransfer() {
 			}
 		}()
 	}
+
+	// Start Retry Scanner
+	go startRetryScanner()
+
 	wg.Wait()
 }
 
@@ -271,10 +291,15 @@ func sendJobStatsUpdate(jobID int64, incSuccess, incFailed int) {
 func processTask(t TransferTask) {
 	start := time.Now()
 
+	if t.RetryCount >= maxRetryCount {
+		log.Printf("Task %d has reached max retry count (%d), skipping", t.ID, maxRetryCount)
+		return
+	}
+
 	job, err := getJobInfo(t.JobID)
 	if err != nil {
 		log.Printf("Failed to get job info for task %d: %v", t.ID, err)
-		updateTaskStatus(t, "FAILED", err.Error())
+		updateTaskStatusWithRetry(t, "FAILED", err.Error())
 		updateJobStats(t.JobID, 0, 1)
 		TasksTransferred.WithLabelValues("failed").Inc()
 		return
@@ -294,7 +319,7 @@ func processTask(t TransferTask) {
 	dstClient, err := createS3Client(job.Metadata.Endpoint, job.Metadata.AK, sk)
 	if err != nil {
 		log.Printf("Dst client init failed for task %d: %v", t.ID, err)
-		updateTaskStatus(t, "FAILED", "Dst client init failed")
+		updateTaskStatusWithRetry(t, "FAILED", "Dst client init failed")
 		updateJobStats(t.JobID, 0, 1)
 		TasksTransferred.WithLabelValues("failed").Inc()
 		return
@@ -336,7 +361,7 @@ func processTask(t TransferTask) {
 		})
 		if err != nil {
 			log.Printf("HeadObject failed for %s/%s: %v", srcBucket, srcKey, err)
-			updateTaskStatus(t, "FAILED", "HeadObject failed: "+err.Error())
+			updateTaskStatusWithRetry(t, "FAILED", "HeadObject failed: "+err.Error())
 			updateJobStats(t.JobID, 0, 1)
 			TasksTransferred.WithLabelValues("failed").Inc()
 			return
@@ -348,7 +373,7 @@ func processTask(t TransferTask) {
 	srcUrl, err := constructVirtualHostURL(cfg.Storage.Src.Endpoint, srcBucket, srcKey)
 	if err != nil {
 		log.Printf("Failed to construct Src URL for task %d: %v", t.ID, err)
-		updateTaskStatus(t, "FAILED", "Construct Src URL failed")
+		updateTaskStatusWithRetry(t, "FAILED", "Construct Src URL failed")
 		updateJobStats(t.JobID, 0, 1)
 		TasksTransferred.WithLabelValues("failed").Inc()
 		return
@@ -361,7 +386,7 @@ func processTask(t TransferTask) {
 	err = transferFile(srcUrl, dstClient, dstBucket, dstKey, size, job.Metadata.Endpoint)
 	if err != nil {
 		log.Printf("Transfer failed for task %d: %v", t.ID, err)
-		updateTaskStatus(t, "FAILED", err.Error())
+		updateTaskStatusWithRetry(t, "FAILED", err.Error())
 		updateJobStats(t.JobID, 0, 1)
 		TasksTransferred.WithLabelValues("failed").Inc()
 	} else {
@@ -379,7 +404,7 @@ func processTask(t TransferTask) {
 			}
 		}
 
-		updateTaskStatus(t, "COMPLETED", "")
+		updateTaskStatusWithRetry(t, "COMPLETED", "")
 		updateJobStats(t.JobID, 1, 0)
 
 		// Metrics
@@ -715,4 +740,139 @@ func getEnvInt(key string, defaultValue int) int {
 		return defaultValue
 	}
 	return n
+}
+
+func updateTaskStatusWithRetry(t TransferTask, status, msg string) {
+	t.Status = status
+
+	var newRetryCount int
+	var newLastRetryTime string
+
+	if status == "FAILED" {
+		newRetryCount = t.RetryCount + 1
+		newLastRetryTime = time.Now().Format(time.RFC3339)
+		TaskRetries.Inc()
+	} else if status == "COMPLETED" {
+		newRetryCount = 0
+		newLastRetryTime = ""
+	} else {
+		newRetryCount = t.RetryCount
+		newLastRetryTime = t.LastRetryTime
+	}
+
+	t.RetryCount = newRetryCount
+	t.LastRetryTime = newLastRetryTime
+
+	payload := []TransferTask{t}
+	data, _ := json.Marshal(payload)
+
+	resp, err := httpClient.Post(apiBaseURL+"/transfer-tasks/update", "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		log.Printf("Failed to update status for task %d: %v", t.ID, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		log.Printf("Failed to update status for task %d: status %d", t.ID, resp.StatusCode)
+	}
+}
+
+func startRetryScanner() {
+	log.Printf("Retry Scanner started with interval %ds, max retry count %d, base delay %ds",
+		retryScannerIntervalSecs, maxRetryCount, retryBaseDelaySecs)
+
+	ticker := time.NewTicker(time.Duration(retryScannerIntervalSecs) * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		failedTasks, err := getFailedTasksForRetry(maxRetryCount)
+		if err != nil {
+			log.Printf("Failed to get failed tasks for retry: %v", err)
+			continue
+		}
+
+		if len(failedTasks) == 0 {
+			continue
+		}
+
+		log.Printf("Found %d failed tasks for retry check", len(failedTasks))
+
+		for _, task := range failedTasks {
+			if !shouldRetryTask(task) {
+				continue
+			}
+
+			log.Printf("Resetting task %d to PENDING (retry count: %d)", task.ID, task.RetryCount)
+			if err := resetTaskToPending(task.ID); err != nil {
+				log.Printf("Failed to reset task %d to PENDING: %v", task.ID, err)
+			}
+		}
+	}
+}
+
+func getFailedTasksForRetry(maxRetryCount int) ([]TransferTask, error) {
+	payload := map[string]interface{}{
+		"max_retry_count": maxRetryCount,
+	}
+	data, _ := json.Marshal(payload)
+
+	resp, err := httpClient.Post(apiBaseURL+"/transfer-tasks/failed-for-retry", "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	var tasks []TransferTask
+	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
+		return nil, err
+	}
+	return tasks, nil
+}
+
+func shouldRetryTask(task TransferTask) bool {
+	if task.RetryCount >= maxRetryCount {
+		return false
+	}
+
+	if task.LastRetryTime == "" {
+		return true
+	}
+
+	lastRetryTime, err := time.Parse(time.RFC3339, task.LastRetryTime)
+	if err != nil {
+		return true
+	}
+
+	var retryDelay time.Duration
+	if task.RetryCount < 30 {
+		retryDelay = time.Duration(int64(retryBaseDelaySecs) * int64(1<<task.RetryCount)) * time.Second
+	} else {
+		retryDelay = time.Duration(int64(retryBaseDelaySecs) * 1073741824) * time.Second
+	}
+	nextRetryTime := lastRetryTime.Add(retryDelay)
+
+	return time.Now().After(nextRetryTime)
+}
+
+func resetTaskToPending(taskID int64) error {
+	payload := map[string]interface{}{
+		"task_id": taskID,
+		"status":  "PENDING",
+	}
+	data, _ := json.Marshal(payload)
+
+	resp, err := httpClient.Post(apiBaseURL+"/transfer-tasks/reset", "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return nil
 }

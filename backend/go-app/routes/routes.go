@@ -95,6 +95,8 @@ func SetupRouter() *gin.Engine {
         {
             txTasks.POST("/acquire", handlers.AcquireTransferTasks)
             txTasks.POST("/update", handlers.BatchUpdateTransfer)
+            txTasks.POST("/failed-for-retry", handlers.GetFailedTasksForRetry)
+            txTasks.POST("/reset", handlers.ResetTransferTask)
         }
 
         // Ffmpeg Jobs

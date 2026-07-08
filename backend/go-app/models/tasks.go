@@ -26,17 +26,19 @@ type YoutubeTask struct {
 }
 
 type TransferTask struct {
-	ID           int64     `json:"id"`
-	JobID        int64     `json:"job_id"`
-	Src          string    `json:"src"`
-	Size         int64     `json:"size"`
-	Status       string    `json:"status"` // PENDING, RUNNING, COMPLETED, FAILED
-	ErrorMessage string    `json:"error_message"`
-	WorkerID     string    `json:"worker_id"`
-	StartedAt    time.Time `json:"started_at"`
-	CompletedAt  time.Time `json:"completed_at"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID            int64     `json:"id"`
+	JobID         int64     `json:"job_id"`
+	Src           string    `json:"src"`
+	Size          int64     `json:"size"`
+	Status        string    `json:"status"` // PENDING, RUNNING, COMPLETED, FAILED
+	ErrorMessage  string    `json:"error_message"`
+	WorkerID      string    `json:"worker_id"`
+	StartedAt     time.Time `json:"started_at"`
+	CompletedAt   time.Time `json:"completed_at"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	RetryCount    int       `json:"retry_count"`
+	LastRetryTime string    `json:"last_retry_time"`
 }
 
 type FfmpegTask struct {

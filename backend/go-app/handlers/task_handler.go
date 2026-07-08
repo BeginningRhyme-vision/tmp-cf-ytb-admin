@@ -2127,11 +2127,6 @@ func BatchUpdateTransfer(c *gin.Context) {
 	successSizeIncrements := make(map[int64]int64)
 
 	for i, u := range updates {
-		data, err := json.Marshal(u)
-		if err != nil {
-			continue
-		}
-
 		var taskKey string
 		taskKey = fmt.Sprintf("tx:task:%d:%d", u.JobID, u.ID)
 
@@ -2142,7 +2137,31 @@ func BatchUpdateTransfer(c *gin.Context) {
 				if existing.Status != "COMPLETED" && u.Status == "COMPLETED" && existing.Size > 0 {
 					successSizeIncrements[u.JobID] += existing.Size
 				}
+
+				if u.ErrorMessage == "" {
+					u.ErrorMessage = existing.ErrorMessage
+				}
+				if u.WorkerID == "" {
+					u.WorkerID = existing.WorkerID
+				}
+				if u.StartedAt.IsZero() {
+					u.StartedAt = existing.StartedAt
+				}
+				if u.CreatedAt.IsZero() {
+					u.CreatedAt = existing.CreatedAt
+				}
+				if u.Size == 0 {
+					u.Size = existing.Size
+				}
+				if u.Src == "" {
+					u.Src = existing.Src
+				}
 			}
+		}
+
+		data, err := json.Marshal(u)
+		if err != nil {
+			continue
 		}
 
 		pipe.Set(ctx, taskKey, data, 0)
@@ -2162,6 +2181,156 @@ func BatchUpdateTransfer(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "updated"})
+}
+
+func GetFailedTasksForRetry(c *gin.Context) {
+	type Request struct {
+		MaxRetryCount int `json:"max_retry_count"`
+	}
+	var req Request
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx := context.Background()
+	failedTasks := []models.TransferTask{}
+
+	jobKeys, err := database.RDB.Keys(ctx, "tx:job:*:tasks").Result()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get job keys: " + err.Error()})
+		return
+	}
+
+	if len(jobKeys) == 0 {
+		c.JSON(http.StatusOK, failedTasks)
+		return
+	}
+
+	var jobIDs []int64
+	for _, key := range jobKeys {
+		var jid int64
+		n, _ := fmt.Sscanf(key, "tx:job:%d:tasks", &jid)
+		if n == 1 {
+			jobIDs = append(jobIDs, jid)
+		}
+	}
+
+	for _, jid := range jobIDs {
+		jobKey := fmt.Sprintf("tx:job:%d:tasks", jid)
+		ids, err := database.RDB.ZRange(ctx, jobKey, 0, -1).Result()
+		if err != nil || len(ids) == 0 {
+			continue
+		}
+
+		var keys []string
+		for _, tid := range ids {
+			var taskID int64
+			fmt.Sscanf(tid, "%d", &taskID)
+			keys = append(keys, fmt.Sprintf("tx:task:%d:%d", jid, taskID))
+		}
+
+		results, err := database.RDB.MGet(ctx, keys...).Result()
+		if err != nil {
+			continue
+		}
+
+		for _, val := range results {
+			if val == nil {
+				continue
+			}
+			str, ok := val.(string)
+			if !ok {
+				continue
+			}
+
+			var task models.TransferTask
+			if err := json.Unmarshal([]byte(str), &task); err != nil {
+				continue
+			}
+
+			if task.Status == "FAILED" && task.RetryCount < req.MaxRetryCount {
+				failedTasks = append(failedTasks, task)
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, failedTasks)
+}
+
+func ResetTransferTask(c *gin.Context) {
+	type Request struct {
+		TaskID int64  `json:"task_id"`
+		Status string `json:"status"`
+	}
+	var req Request
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Status != "PENDING" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Only PENDING status is allowed for reset"})
+		return
+	}
+
+	ctx := context.Background()
+
+	jobKeys, err := database.RDB.Keys(ctx, "tx:job:*:tasks").Result()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get job keys: " + err.Error()})
+		return
+	}
+
+	var jobIDs []int64
+	for _, key := range jobKeys {
+		var jid int64
+		n, _ := fmt.Sscanf(key, "tx:job:%d:tasks", &jid)
+		if n == 1 {
+			jobIDs = append(jobIDs, jid)
+		}
+	}
+
+	var found bool
+	for _, jid := range jobIDs {
+		taskKey := fmt.Sprintf("tx:task:%d:%d", jid, req.TaskID)
+		val, err := database.RDB.Get(ctx, taskKey).Result()
+		if err != nil {
+			continue
+		}
+
+		var task models.TransferTask
+		if err := json.Unmarshal([]byte(val), &task); err != nil {
+			continue
+		}
+
+		task.Status = req.Status
+		task.WorkerID = ""
+		task.StartedAt = time.Time{}
+		task.CompletedAt = time.Time{}
+		task.ErrorMessage = ""
+		task.UpdatedAt = time.Now()
+
+		data, err := json.Marshal(task)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		database.RDB.Set(ctx, taskKey, data, 0)
+
+		database.DB.Exec("UPDATE transfer_jobs SET failed_count = failed_count - 1, pending_count = pending_count + 1 WHERE job_id = ?", jid)
+
+		found = true
+		break
+	}
+
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "reset"})
 }
 
 // func BatchUpdateTransfer(c *gin.Context) {

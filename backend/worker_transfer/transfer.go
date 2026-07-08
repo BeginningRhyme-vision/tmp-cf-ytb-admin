@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -59,23 +61,27 @@ type JobStatsDelta struct {
 }
 
 var (
-	jobCache           sync.Map // JobID -> cachedJob
-	httpClient         *http.Client
-	transferClient     *http.Client
-	workerCount        int
-	taskBufferSize     int
-	partConcurrency    int
-	multipartThreshold int64
-	minPartSize        int64
-	maxRetryCount      int
-	retryBaseDelaySecs int
-	retryScannerIntervalSecs int
+	jobCache                   sync.Map // JobID -> cachedJob
+	httpClient                 *http.Client
+	transferClient             *http.Client
+	workerCount                int
+	taskBufferSize             int
+	partConcurrency            int
+	multipartThreshold         int64
+	minPartSize                int64
+	maxRetryCount              int
+	retryBaseDelaySecs         int
+	retryScannerIntervalSecs   int
 
 	s3Clients sync.Map // Endpoint -> *s3.Client (Cache for Destinations)
 	srcClient *s3.Client
 
 	statsBuffer = make(map[int64]*JobStatsDelta)
 	statsMutex  sync.Mutex
+
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	shutdownWg     sync.WaitGroup
 
 	// Metrics
 	BytesTransferred = promauto.NewCounter(prometheus.CounterOpts{
@@ -97,6 +103,22 @@ var (
 		Name: "transfer_task_retries_total",
 		Help: "Total number of task retries",
 	})
+
+	RetryDelayHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "transfer_task_retry_delay_seconds",
+		Help:    "Distribution of retry delays between attempts",
+		Buckets: prometheus.ExponentialBuckets(60, 2, 8),
+	})
+
+	RetrySuccessCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "transfer_task_retry_success_total",
+		Help: "Total successful retries by retry attempt number",
+	}, []string{"retry_count"})
+
+	RetryFailedCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "transfer_task_retry_failed_total",
+		Help: "Total failed retries by retry attempt number",
+	}, []string{"retry_count"})
 )
 
 const (
@@ -115,6 +137,16 @@ const (
 
 func runTransfer() {
 	loadConfig()
+
+	shutdownCtx, shutdownCancel = context.WithCancel(context.Background())
+
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+		log.Println("Received shutdown signal, stopping gracefully...")
+		shutdownCancel()
+	}()
 
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
@@ -170,28 +202,43 @@ func runTransfer() {
 
 	// Start Fetcher
 	go func() {
+		shutdownWg.Add(1)
+		defer shutdownWg.Done()
+
 		for {
-			// Backpressure: if channel is mostly full, wait a bit
-			if len(taskChan) >= taskBufferSize-20 {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
+			select {
+			case <-shutdownCtx.Done():
+				log.Println("Fetcher stopping...")
+				close(taskChan)
+				return
+			default:
+				if len(taskChan) >= taskBufferSize-20 {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
 
-			tasks, err := acquireTasks()
-			if err != nil {
-				log.Printf("Error acquiring tasks: %v", err)
-				time.Sleep(2 * time.Second)
-				continue
-			}
+				tasks, err := acquireTasks()
+				if err != nil {
+					log.Printf("Error acquiring tasks: %v", err)
+					time.Sleep(2 * time.Second)
+					continue
+				}
 
-			if len(tasks) == 0 {
-				time.Sleep(1 * time.Second)
-				continue
-			}
+				if len(tasks) == 0 {
+					time.Sleep(1 * time.Second)
+					continue
+				}
 
-			log.Printf("Acquired %d tasks", len(tasks))
-			for _, t := range tasks {
-				taskChan <- t
+				log.Printf("Acquired %d tasks", len(tasks))
+				for _, t := range tasks {
+					select {
+					case taskChan <- t:
+					case <-shutdownCtx.Done():
+						log.Println("Fetcher stopping mid-task...")
+						close(taskChan)
+						return
+					}
+				}
 			}
 		}
 	}()
@@ -212,13 +259,27 @@ func runTransfer() {
 	go startRetryScanner()
 
 	wg.Wait()
+	shutdownWg.Wait()
+
+	log.Println("Transfer Worker stopped gracefully")
 }
 
 func initStatsFlusher() {
 	go func() {
+		shutdownWg.Add(1)
+		defer shutdownWg.Done()
+
 		ticker := time.NewTicker(3 * time.Second)
-		for range ticker.C {
-			flushStats()
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				log.Println("Stats flusher stopping...")
+				return
+			case <-ticker.C:
+				flushStats()
+			}
 		}
 	}()
 }
@@ -752,9 +813,13 @@ func updateTaskStatusWithRetry(t TransferTask, status, msg string) {
 		newRetryCount = t.RetryCount + 1
 		newLastRetryTime = time.Now().Format(time.RFC3339)
 		TaskRetries.Inc()
+		RetryFailedCounter.WithLabelValues(strconv.Itoa(newRetryCount)).Inc()
 	} else if status == "COMPLETED" {
 		newRetryCount = 0
 		newLastRetryTime = ""
+		if t.RetryCount > 0 {
+			RetrySuccessCounter.WithLabelValues(strconv.Itoa(t.RetryCount)).Inc()
+		}
 	} else {
 		newRetryCount = t.RetryCount
 		newLastRetryTime = t.LastRetryTime
@@ -778,33 +843,42 @@ func updateTaskStatusWithRetry(t TransferTask, status, msg string) {
 }
 
 func startRetryScanner() {
+	shutdownWg.Add(1)
+	defer shutdownWg.Done()
+
 	log.Printf("Retry Scanner started with interval %ds, max retry count %d, base delay %ds",
 		retryScannerIntervalSecs, maxRetryCount, retryBaseDelaySecs)
 
 	ticker := time.NewTicker(time.Duration(retryScannerIntervalSecs) * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		failedTasks, err := getFailedTasksForRetry(maxRetryCount)
-		if err != nil {
-			log.Printf("Failed to get failed tasks for retry: %v", err)
-			continue
-		}
-
-		if len(failedTasks) == 0 {
-			continue
-		}
-
-		log.Printf("Found %d failed tasks for retry check", len(failedTasks))
-
-		for _, task := range failedTasks {
-			if !shouldRetryTask(task) {
+	for {
+		select {
+		case <-shutdownCtx.Done():
+			log.Println("Retry Scanner stopping...")
+			return
+		case <-ticker.C:
+			failedTasks, err := getFailedTasksForRetry(maxRetryCount)
+			if err != nil {
+				log.Printf("Failed to get failed tasks for retry: %v", err)
 				continue
 			}
 
-			log.Printf("Resetting task %d to PENDING (retry count: %d)", task.ID, task.RetryCount)
-			if err := resetTaskToPending(task.ID); err != nil {
-				log.Printf("Failed to reset task %d to PENDING: %v", task.ID, err)
+			if len(failedTasks) == 0 {
+				continue
+			}
+
+			log.Printf("Found %d failed tasks for retry check", len(failedTasks))
+
+			for _, task := range failedTasks {
+				if !shouldRetryTask(task) {
+					continue
+				}
+
+				log.Printf("Resetting task %d to PENDING (retry count: %d)", task.ID, task.RetryCount)
+				if err := resetTaskToPending(task.ID); err != nil {
+					log.Printf("Failed to reset task %d to PENDING: %v", task.ID, err)
+				}
 			}
 		}
 	}
@@ -853,9 +927,13 @@ func shouldRetryTask(task TransferTask) bool {
 	} else {
 		retryDelay = time.Duration(int64(retryBaseDelaySecs) * 1073741824) * time.Second
 	}
-	nextRetryTime := lastRetryTime.Add(retryDelay)
 
-	return time.Now().After(nextRetryTime)
+	if time.Now().After(lastRetryTime.Add(retryDelay)) {
+		RetryDelayHistogram.Observe(retryDelay.Seconds())
+		return true
+	}
+
+	return false
 }
 
 func resetTaskToPending(taskID int64) error {

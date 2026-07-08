@@ -2304,6 +2304,11 @@ func ResetTransferTask(c *gin.Context) {
 			continue
 		}
 
+		if task.Status != "FAILED" {
+			log.Printf("Task %d is %s, cannot reset", task.ID, task.Status)
+			continue
+		}
+
 		task.Status = req.Status
 		task.WorkerID = ""
 		task.StartedAt = time.Time{}

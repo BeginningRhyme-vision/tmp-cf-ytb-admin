@@ -1153,8 +1153,16 @@ func transferFile(ctx context.Context, srcURL string, dstClient *s3.Client, dstB
 		wg.Add(1)
 		go func(pNum int32, s, e int64) {
 			defer wg.Done()
-			if !acquirePartSlot(sem) {
-				return
+			for !acquirePartSlot(sem) {
+				select {
+				case <-ctx.Done():
+					select {
+					case errAbort <- ctx.Err():
+					default:
+					}
+					return
+				case <-time.After(500 * time.Millisecond):
+				}
 			}
 			defer func() { <-sem }()
 

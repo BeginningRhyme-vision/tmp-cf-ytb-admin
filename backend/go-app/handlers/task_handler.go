@@ -2117,19 +2117,18 @@ func AcquireTransferTasks(c *gin.Context) {
 	}
 
 	maxPerJob := req.Limit / len(jobIDs)
-	
-	if len(jobIDs) > req.Limit {
-		rand.Shuffle(len(jobIDs), func(i, j int) {
-			jobIDs[i], jobIDs[j] = jobIDs[j], jobIDs[i]
-		})
-		jobIDs = jobIDs[:req.Limit]
-		maxPerJob = 1
-	} else if maxPerJob < 1 {
+	if maxPerJob < 1 {
 		maxPerJob = 1
 	}
 
-	for len(tasks) < req.Limit {
-		gotAny := false
+	// 随机打乱顺序，避免固定顺序导致的饥饿
+	rand.Shuffle(len(jobIDs), func(i, j int) {
+		jobIDs[i], jobIDs[j] = jobIDs[j], jobIDs[i]
+	})
+
+	// 轮询调度：每个 Job 轮流拿 1 个任务，直到 limit 满或所有 buffer 都空了
+	// 这样即使某些 Job 的 buffer 暂时为空，也不会影响其他 Job 的公平性
+	for i := 0; i < maxPerJob && len(tasks) < req.Limit; i++ {
 		for _, jid := range jobIDs {
 			if len(tasks) >= req.Limit {
 				break
@@ -2146,18 +2145,11 @@ func AcquireTransferTasks(c *gin.Context) {
 				triggerTxRefill(jid)
 			}
 
-			for i := 0; i < maxPerJob && len(tasks) < req.Limit; i++ {
-				select {
-				case t := <-ch:
-					tasks = append(tasks, t)
-					gotAny = true
-				default:
-					break
-				}
+			select {
+			case t := <-ch:
+				tasks = append(tasks, t)
+			default:
 			}
-		}
-		if !gotAny {
-			break
 		}
 	}
 	c.JSON(http.StatusOK, tasks)

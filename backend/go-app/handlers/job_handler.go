@@ -833,6 +833,10 @@ func AddTasksToTransferJob(c *gin.Context) {
 	// Update Job stats
 	if count > 0 {
 		database.DB.Exec("UPDATE transfer_jobs SET total_count = total_count + ?, pending_count = pending_count + ?, status = CASE WHEN status = 'COMPLETED' THEN 'RUNNING' ELSE status END WHERE job_id = ?", count, count, id)
+
+		// 关键：初始化并填充任务 buffer，让 worker 可以立即获取新任务
+		ensureTxBuffer(int64(id))
+		triggerTxRefill(int64(id))
 	}
 
 	c.JSON(http.StatusOK, gin.H{"added": count, "job_id": id})

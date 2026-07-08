@@ -1885,6 +1885,28 @@ func fillShardedTxBuffer(ctx context.Context, jobID int64) {
 		fmt.Sscanf(offsetStr, "%d", &lastTaskID)
 	}
 
+	// 获取当前最大任务 ID
+	maxIDKey := fmt.Sprintf("tx:job:%d:max_id", jobID)
+	maxIDStr, _ := database.RDB.Get(ctx, maxIDKey).Result()
+	var currentMaxID int64
+	if maxIDStr != "" {
+		fmt.Sscanf(maxIDStr, "%d", &currentMaxID)
+	}
+
+	// 如果 offset 超过了当前最大任务 ID，说明任务还在持续写入中
+	// 我们需要等待任务写入完成，或者重置 offset 到当前最大 ID - 一个批次
+	// 这样可以确保我们能读取到最近写入的任务
+	if lastTaskID > currentMaxID && currentMaxID > 0 {
+		// offset 跑过了，重置到 currentMaxID - TxFetchBatchSize
+		// 这样可以读取最近写入的一批任务
+		newOffset := currentMaxID - TxFetchBatchSize
+		if newOffset < 0 {
+			newOffset = 0
+		}
+		database.RDB.Set(ctx, offsetKey, newOffset, 0)
+		lastTaskID = newOffset
+	}
+
 	// 下一个要读的 ID
 	startID := lastTaskID + 1
 
@@ -2138,6 +2160,9 @@ func AcquireTransferTasks(c *gin.Context) {
 			ch, ok := txJobBuffers[jid]
 			bufferMutex.RUnlock()
 			if !ok {
+				// buffer 不存在，立即初始化并触发填充
+				ensureTxBuffer(jid)
+				triggerTxRefill(jid)
 				continue
 			}
 

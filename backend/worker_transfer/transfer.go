@@ -74,6 +74,10 @@ var (
 	maxRetryCount            int
 	retryBaseDelaySecs       int
 	retryScannerIntervalSecs int
+	minTimeoutSecs           int
+	maxTimeoutSecs           int
+	minThroughputMBPS        int
+	chunkReadTimeoutSecs     int
 
 	s3Clients sync.Map // Endpoint -> *s3.Client (Cache for Destinations)
 	srcClient *s3.Client
@@ -150,11 +154,14 @@ const (
 	DefaultPartConcurrency          = 16
 	DefaultMultipartThresholdMB     = 16
 	DefaultMinPartSizeMB            = 8
-	DefaultTransferTimeoutSecs      = 300
 	DefaultMaxConnections           = 2048
 	DefaultMaxRetryCount            = 3
 	DefaultRetryBaseDelaySecs       = 60
 	DefaultRetryScannerIntervalSecs = 30
+	DefaultMinTimeoutSecs           = 30
+	DefaultMaxTimeoutSecs           = 10800
+	DefaultMinThroughputMBPS        = 2
+	DefaultChunkReadTimeoutSecs     = 30
 )
 
 func runTransfer() {
@@ -185,11 +192,14 @@ func runTransfer() {
 	partConcurrency = getEnvInt("TRANSFER_PART_CONCURRENCY", DefaultPartConcurrency)
 	multipartThreshold = int64(getEnvInt("TRANSFER_MULTIPART_THRESHOLD_MB", DefaultMultipartThresholdMB)) * 1024 * 1024
 	minPartSize = int64(getEnvInt("TRANSFER_MIN_PART_SIZE_MB", DefaultMinPartSizeMB)) * 1024 * 1024
-	transferTimeoutSecs := getEnvInt("TRANSFER_TIMEOUT_SECS", DefaultTransferTimeoutSecs)
 	maxConnections := getEnvInt("TRANSFER_MAX_CONNECTIONS", DefaultMaxConnections)
 	maxRetryCount = getEnvInt("TRANSFER_MAX_RETRY_COUNT", DefaultMaxRetryCount)
 	retryBaseDelaySecs = getEnvInt("TRANSFER_RETRY_BASE_DELAY_SECS", DefaultRetryBaseDelaySecs)
 	retryScannerIntervalSecs = getEnvInt("TRANSFER_RETRY_SCANNER_INTERVAL_SECS", DefaultRetryScannerIntervalSecs)
+	minTimeoutSecs = getEnvInt("TRANSFER_MIN_TIMEOUT_SECS", DefaultMinTimeoutSecs)
+	maxTimeoutSecs = getEnvInt("TRANSFER_MAX_TIMEOUT_SECS", DefaultMaxTimeoutSecs)
+	minThroughputMBPS = getEnvInt("TRANSFER_MIN_THROUGHPUT_MBPS", DefaultMinThroughputMBPS)
+	chunkReadTimeoutSecs = getEnvInt("TRANSFER_CHUNK_READ_TIMEOUT_SECS", DefaultChunkReadTimeoutSecs)
 	httpClient = &http.Client{
 		Timeout: 20 * time.Second,
 		Transport: &http.Transport{
@@ -218,8 +228,8 @@ func runTransfer() {
 		ResponseHeaderTimeout: 60 * time.Second,
 	}
 	transferClient = &http.Client{
-		Timeout:   time.Duration(transferTimeoutSecs) * time.Second,
 		Transport: transferTransport,
+		Timeout:   time.Duration(maxTimeoutSecs) * time.Second,
 	}
 
 	initSourceClient()
@@ -292,6 +302,42 @@ func runTransfer() {
 	shutdownWg.Wait()
 
 	log.Println("Transfer Worker stopped gracefully")
+}
+
+func calculateDynamicTimeout(size int64) time.Duration {
+	minTimeout := time.Duration(minTimeoutSecs) * time.Second
+	maxTimeout := time.Duration(maxTimeoutSecs) * time.Second
+
+	if size <= 0 {
+		return minTimeout
+	}
+
+	if minThroughputMBPS <= 0 {
+		return maxTimeout
+	}
+
+	calculated := time.Duration(size/(int64(minThroughputMBPS)*1024*1024)) * time.Second
+	if calculated < minTimeout {
+		return minTimeout
+	}
+	if calculated > maxTimeout {
+		return maxTimeout
+	}
+	return calculated
+}
+
+func calculatePartTimeout(partSize int64) time.Duration {
+	return calculateDynamicTimeout(partSize)
+}
+
+func validateTimeoutConfig(min, max, throughput int) bool {
+	if min <= 0 || max <= 0 || throughput <= 0 {
+		return false
+	}
+	if min > max {
+		return false
+	}
+	return true
 }
 
 func initStatsFlusher() {
@@ -503,7 +549,9 @@ func processTask(t TransferTask) {
 	size := t.Size
 
 	if size == 0 {
-		head, err := srcClient.HeadObject(context.TODO(), &s3.HeadObjectInput{
+		headCtx, headCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer headCancel()
+		head, err := srcClient.HeadObject(headCtx, &s3.HeadObjectInput{
 			Bucket: aws.String(srcBucket),
 			Key:    aws.String(srcKey),
 		})
@@ -530,8 +578,13 @@ func processTask(t TransferTask) {
 	dstBucket := getBucketFromEndpoint(job.Metadata.Endpoint)
 	log.Printf("Task %d: Transferring %d bytes to bucket '%s' key '%s'", t.ID, size, dstBucket, dstKey)
 
-	// 5. Transfer Loop
-	err = transferFile(srcUrl, dstClient, dstBucket, dstKey, size, job.Metadata.Endpoint)
+	taskTimeout := calculateDynamicTimeout(size)
+	log.Printf("Task %d: Calculated dynamic timeout: %v", t.ID, taskTimeout)
+
+	taskCtx, taskCancel := context.WithTimeout(shutdownCtx, taskTimeout)
+	defer taskCancel()
+
+	err = transferFile(taskCtx, srcUrl, dstClient, dstBucket, dstKey, size, job.Metadata.Endpoint)
 	if err != nil {
 		log.Printf("Transfer failed for task %d: %v", t.ID, err)
 		updateTaskStatusWithRetry(t, "FAILED", err.Error())
@@ -541,7 +594,9 @@ func processTask(t TransferTask) {
 		log.Printf("Task %d completed successfully", t.ID)
 
 		if job.DeleteSource {
-			_, err := srcClient.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+			deleteCtx, deleteCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer deleteCancel()
+			_, err := srcClient.DeleteObject(deleteCtx, &s3.DeleteObjectInput{
 				Bucket: aws.String(srcBucket),
 				Key:    aws.String(srcKey),
 			})
@@ -563,19 +618,20 @@ func processTask(t TransferTask) {
 	}
 }
 
-func transferFile(srcURL string, dstClient *s3.Client, dstBucket, dstKey string, size int64, dstEndpoint string) error {
+func transferFile(ctx context.Context, srcURL string, dstClient *s3.Client, dstBucket, dstKey string, size int64, dstEndpoint string) error {
 	dstUrl, err := constructVirtualHostURL(dstEndpoint, dstBucket, dstKey)
 	if err != nil {
 		return err
 	}
 
 	if size < multipartThreshold {
-		_, err = callTransferService(srcURL, dstUrl, size, 0, "", -1)
+		_, err = callTransferService(ctx, srcURL, dstUrl, size, 0, "", -1)
 		return err
 	}
 
-	// Multipart
-	createOut, err := dstClient.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
+	createCtx, createCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer createCancel()
+	createOut, err := dstClient.CreateMultipartUpload(createCtx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(dstBucket),
 		Key:    aws.String(dstKey),
 	})
@@ -608,8 +664,12 @@ func transferFile(srcURL string, dstClient *s3.Client, dstBucket, dstKey string,
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			// Use clean URLs, no presigning
-			etag, err := callTransferService(srcURL, dstUrl, e-s+1, s, uploadID, int(pNum))
+			partSizeBytes := e - s + 1
+			partTimeout := calculatePartTimeout(partSizeBytes)
+			partCtx, partCancel := context.WithTimeout(ctx, partTimeout)
+			defer partCancel()
+
+			etag, err := callTransferService(partCtx, srcURL, dstUrl, partSizeBytes, s, uploadID, int(pNum))
 			if err != nil {
 				select {
 				case errAbort <- err:
@@ -631,14 +691,15 @@ func transferFile(srcURL string, dstClient *s3.Client, dstBucket, dstKey string,
 
 	select {
 	case err := <-errAbort:
-		dstClient.AbortMultipartUpload(context.TODO(), &s3.AbortMultipartUploadInput{
+		abortCtx, abortCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer abortCancel()
+		dstClient.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
 			Bucket: aws.String(dstBucket), Key: aws.String(dstKey), UploadId: aws.String(uploadID),
 		})
 		return err
 	default:
 	}
 
-	// Sort
 	for i := 0; i < len(completedParts); i++ {
 		for j := i + 1; j < len(completedParts); j++ {
 			if *completedParts[i].PartNumber > *completedParts[j].PartNumber {
@@ -647,18 +708,16 @@ func transferFile(srcURL string, dstClient *s3.Client, dstBucket, dstKey string,
 		}
 	}
 
-	_, err = dstClient.CompleteMultipartUpload(context.TODO(), &s3.CompleteMultipartUploadInput{
+	completeCtx, completeCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer completeCancel()
+	_, err = dstClient.CompleteMultipartUpload(completeCtx, &s3.CompleteMultipartUploadInput{
 		Bucket: aws.String(dstBucket), Key: aws.String(dstKey), UploadId: aws.String(uploadID),
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: completedParts},
 	})
 	return err
 }
 
-func callTransferService(srcUrl, dstUrl string, size, offset int64, uploadID string, partNum int) (string, error) {
-	// Payload matches r2s3 / downloader logic
-	// But `r2s3` sent `r2Key` and `s3Url`.
-	// We are sending Presigned URLs for both.
-
+func callTransferService(ctx context.Context, srcUrl, dstUrl string, size, offset int64, uploadID string, partNum int) (string, error) {
 	payload := map[string]interface{}{
 		"r2Key":      srcUrl,
 		"s3Url":      dstUrl,
@@ -670,14 +729,30 @@ func callTransferService(srcUrl, dstUrl string, size, offset int64, uploadID str
 
 	body, _ := json.Marshal(payload)
 
-	// Retry
 	var lastErr error
 	for i := 0; i < 5; i++ {
-		resp, err := transferClient.Post(cfg.Storage.TransferServiceURL, "application/json", bytes.NewBuffer(body))
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", cfg.Storage.TransferServiceURL, bytes.NewBuffer(body))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := transferClient.Do(req)
 		if err != nil {
 			lastErr = err
-			time.Sleep(time.Duration(i+1) * time.Second)
-			continue
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			default:
+				time.Sleep(time.Duration(i+1) * time.Second)
+				continue
+			}
 		}
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -686,18 +761,33 @@ func callTransferService(srcUrl, dstUrl string, size, offset int64, uploadID str
 			var res map[string]interface{}
 			if err := json.Unmarshal(respBody, &res); err != nil {
 				lastErr = fmt.Errorf("decode response failed: %w", err)
-				time.Sleep(time.Duration(i+1) * time.Second)
-				continue
+				select {
+				case <-ctx.Done():
+					return "", ctx.Err()
+				default:
+					time.Sleep(time.Duration(i+1) * time.Second)
+					continue
+				}
 			}
 			if etag, ok := res["etag"].(string); ok {
 				return etag, nil
 			}
 			lastErr = fmt.Errorf("etag missing in response")
-			time.Sleep(time.Duration(i+1) * time.Second)
-			continue
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			default:
+				time.Sleep(time.Duration(i+1) * time.Second)
+				continue
+			}
 		}
 		lastErr = fmt.Errorf("status %d body %s", resp.StatusCode, string(respBody))
-		time.Sleep(time.Duration(i+1) * time.Second)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+			time.Sleep(time.Duration(i+1) * time.Second)
+		}
 	}
 	return "", fmt.Errorf("service call failed: %v", lastErr)
 }
@@ -784,6 +874,7 @@ func createS3Client(endpoint, ak, sk string) (*s3.Client, error) {
 		awsconfig.WithRegion("auto"),
 		awsconfig.WithHTTPClient(&http.Client{
 			Transport: httpTransport,
+			Timeout:   time.Duration(maxTimeoutSecs) * time.Second,
 		}),
 	)
 	if err != nil {

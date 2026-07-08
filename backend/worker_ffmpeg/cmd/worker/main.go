@@ -45,6 +45,7 @@ var (
 	jobCacheExpiry sync.Map // JobID -> time.Time
 	taskQueue      string
 	failedQueue    string
+	httpClient     *http.Client
 
 	reservedSpace int64
 	reservedMux   sync.Mutex
@@ -101,6 +102,10 @@ func main() {
 	initQueueConfig()
 
 	initRedis()
+
+	httpClient = &http.Client{
+		Timeout: 20 * time.Second,
+	}
 
 	go func() {
 		http.Handle("/metrics", promhttp.Handler())
@@ -266,7 +271,7 @@ func reportResultPatch(jobID int64, success bool, successBytes int64) {
 	reqObj, _ := http.NewRequest("PATCH", fmt.Sprintf("%s/ffmpeg-jobs/%d/status", apiBaseURL, jobID), bytes.NewBuffer(data))
 	reqObj.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(reqObj)
+	resp, err := httpClient.Do(reqObj)
 	if err != nil {
 		log.Printf("Failed to report result for job %d: %v", jobID, err)
 		return

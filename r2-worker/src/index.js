@@ -14,6 +14,17 @@ function isRetryableStatus(status) {
   return status === 408 || status === 429 || (status >= 500 && status <= 599);
 }
 
+function createTimeoutController(timeoutMs) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+  return {
+    controller,
+    cleanup: () => clearTimeout(timeoutId)
+  };
+}
+
 export default {
   /**
    * Handle incoming HTTP requests
@@ -61,7 +72,8 @@ export default {
 
       } catch (error) {
         console.error("Copy error:", error);
-        return new Response(`Error processing copy: ${error.message}`, { status: 500 });
+        const status = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+        return new Response(`Error processing copy: ${error.message}`, { status });
       }
     } else if (pathname === "/upload-part") {
       if (request.method !== "POST") {
@@ -133,7 +145,6 @@ async function processDownloadMessage(task, env) {
     ];
     const randomUA = userAgents[Math.floor(Math.random() * userAgents.length)];
     
-    // Add realistic fetch headers and sec-ch-ua headers based on UA
     const isChrome = randomUA.includes('Chrome');
     const isWindows = randomUA.includes('Windows');
     
@@ -163,102 +174,136 @@ async function processDownloadMessage(task, env) {
     let r2KeyUrl = r2Key;
     const destUrl = new URL(r2KeyUrl);
 
-    // Check if r2Key is already a presigned URL (contains X-Amz-Signature)
     const isPresignedUrl = destUrl.searchParams.has("X-Amz-Signature");
 
+    if (partNumber !== -1) {
+      destUrl.searchParams.set("partNumber", partNumber);
+      destUrl.searchParams.set("uploadId", uploadId);
+    }
+
+    let destAwsClient = null;
+    if (!isPresignedUrl) {
+      if (!env.SOURCE_ACCESS_KEY_ID || !env.SOURCE_SECRET_ACCESS_KEY) {
+        throw new Error("Missing required environment variables: SOURCE_ACCESS_KEY_ID and SOURCE_SECRET_ACCESS_KEY must be set in wrangler.toml or as environment variables");
+      }
+
+      destAwsClient = new AwsClient({
+        accessKeyId: env.SOURCE_ACCESS_KEY_ID,
+        secretAccessKey: env.SOURCE_SECRET_ACCESS_KEY,
+        service: "s3",
+        region: "auto",
+      });
+    }
+
+    const DEFAULT_TIMEOUT = 60000;
+    const timeoutMs = Number.parseInt(env?.FETCH_TIMEOUT_MS || "60000", 10) || DEFAULT_TIMEOUT;
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const sourceResponse = await fetch(fileUrl, {
-        method: 'GET',
-        headers: sourceHeaders,
-        redirect: 'follow'
-      });
-
-      if (!sourceResponse.ok) {
-        if (isRetryableStatus(sourceResponse.status) && attempt < maxAttempts) {
-          console.error(`Source fetch failed for ${safeDest} part=${partNumber} attempt=${attempt}/${maxAttempts} status=${sourceResponse.status}`)
-          await sleep(backoffMs(attempt));
-          continue;
-        }
-        throw createHttpError(502, `Failed to download from source: ${sourceResponse.status} ${sourceResponse.statusText}`);
-      }
-
-      if (!sourceResponse.body) {
-        if (attempt < maxAttempts) {
-          console.error(`Source response missing body for ${safeDest} part=${partNumber} attempt=${attempt}/${maxAttempts}`)
-          await sleep(backoffMs(attempt));
-          continue;
-        }
-        throw createHttpError(502, "Source response has no body");
-      }
-
-      let requestHeaders = {
-        "Content-Length": size.toString(),
-      };
-
-      if (!isPresignedUrl) {
-        if (!env.SOURCE_ACCESS_KEY_ID || !env.SOURCE_SECRET_ACCESS_KEY) {
-          throw new Error("Missing required environment variables: SOURCE_ACCESS_KEY_ID and SOURCE_SECRET_ACCESS_KEY must be set in wrangler.toml or as environment variables");
-        }
-
-        const destAwsClient = new AwsClient({
-          accessKeyId: env.SOURCE_ACCESS_KEY_ID,
-          secretAccessKey: env.SOURCE_SECRET_ACCESS_KEY,
-          service: "s3",
-          region: "auto",
+      const timeoutCtrl = createTimeoutController(timeoutMs);
+      try {
+        const sourceResponse = await fetch(fileUrl, {
+          method: 'GET',
+          headers: sourceHeaders,
+          redirect: 'follow',
+          signal: timeoutCtrl.controller.signal
         });
+        timeoutCtrl.cleanup();
 
-        if (partNumber !== -1) {
-          destUrl.searchParams.set("partNumber", partNumber);
-          destUrl.searchParams.set("uploadId", uploadId);
+        if (!sourceResponse.ok) {
+          if (isRetryableStatus(sourceResponse.status) && attempt < maxAttempts) {
+            console.error(`Source fetch failed for ${safeDest} part=${partNumber} attempt=${attempt}/${maxAttempts} status=${sourceResponse.status}`)
+            await sleep(backoffMs(attempt));
+            continue;
+          }
+          throw createHttpError(502, `Failed to download from source: ${sourceResponse.status} ${sourceResponse.statusText}`);
         }
 
-        const signedRequest = await destAwsClient.sign(destUrl.toString(), {
-          method: 'PUT',
-          headers: {
-            ...requestHeaders,
-            "X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
-          },
-        });
-        requestHeaders = signedRequest.headers;
-      } else if (partNumber !== -1) {
-        destUrl.searchParams.set("partNumber", partNumber);
-        destUrl.searchParams.set("uploadId", uploadId);
-      }
-
-      const s3Response = await fetch(destUrl.toString(), {
-        method: 'PUT',
-        body: sourceResponse.body,
-        headers: requestHeaders,
-      });
-
-      if (!s3Response.ok) {
-        const errorText = await s3Response.text();
-        if (isRetryableStatus(s3Response.status) && attempt < maxAttempts) {
-          console.error(`Upload failed for ${safeDest} part=${partNumber} attempt=${attempt}/${maxAttempts} status=${s3Response.status} body=${errorText}`)
-          await sleep(backoffMs(attempt));
-          continue;
+        if (!sourceResponse.body) {
+          if (attempt < maxAttempts) {
+            console.error(`Source response missing body for ${safeDest} part=${partNumber} attempt=${attempt}/${maxAttempts}`)
+            await sleep(backoffMs(attempt));
+            continue;
+          }
+          throw createHttpError(502, "Source response has no body");
         }
-        throw new Error(`Failed to upload to S3: ${s3Response.status} ${errorText}`);
-      }
 
-      const etag = s3Response.headers.get("etag") || s3Response.headers.get("ETag");
-      if (!etag) {
-        if (attempt < maxAttempts) {
-          console.error(`Upload ok but missing etag for ${safeDest} part=${partNumber} attempt=${attempt}/${maxAttempts}`)
-          await sleep(backoffMs(attempt));
-          continue;
+        let requestHeaders = {
+          "Content-Length": size.toString(),
+        };
+
+        if (!isPresignedUrl) {
+          const signedRequest = await destAwsClient.sign(destUrl.toString(), {
+            method: 'PUT',
+            headers: {
+              ...requestHeaders,
+              "X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
+            },
+          });
+          requestHeaders = signedRequest.headers;
         }
-        throw createHttpError(502, `No ETag found in S3 response for uploadId=${uploadId} part=${partNumber}`);
-      }
 
-      console.log(`Upload success for ${safeDest} part=${partNumber} etag=${etag}`)
-      return { etag };
+        const uploadTimeoutCtrl = createTimeoutController(timeoutMs);
+        try {
+          const s3Response = await fetch(destUrl.toString(), {
+            method: 'PUT',
+            body: sourceResponse.body,
+            headers: requestHeaders,
+            signal: uploadTimeoutCtrl.controller.signal
+          });
+          uploadTimeoutCtrl.cleanup();
+
+          if (!s3Response.ok) {
+            const errorText = await s3Response.text();
+            if (isRetryableStatus(s3Response.status) && attempt < maxAttempts) {
+              console.error(`Upload failed for ${safeDest} part=${partNumber} attempt=${attempt}/${maxAttempts} status=${s3Response.status} body=${errorText}`)
+              await sleep(backoffMs(attempt));
+              continue;
+            }
+            throw createHttpError(502, `Failed to upload to S3: ${s3Response.status} ${errorText}`);
+          }
+
+          const etag = s3Response.headers.get("etag") || s3Response.headers.get("ETag");
+          if (!etag) {
+            if (attempt < maxAttempts) {
+              console.error(`Upload ok but missing etag for ${safeDest} part=${partNumber} attempt=${attempt}/${maxAttempts}`)
+              await sleep(backoffMs(attempt));
+              continue;
+            }
+            throw createHttpError(502, `No ETag found in S3 response for uploadId=${uploadId} part=${partNumber}`);
+          }
+
+          console.log(`Upload success for ${safeDest} part=${partNumber} etag=${etag}`)
+          return { etag };
+        } catch (uploadErr) {
+          uploadTimeoutCtrl.cleanup();
+          if (uploadErr.name === 'AbortError') {
+            console.error(`Upload timeout for ${safeDest} part=${partNumber} attempt=${attempt}/${maxAttempts}`);
+            if (attempt < maxAttempts) {
+              await sleep(backoffMs(attempt));
+              continue;
+            }
+            throw createHttpError(504, `Upload timeout for ${safeDest} part=${partNumber}`);
+          }
+          throw uploadErr;
+        }
+      } catch (sourceErr) {
+        timeoutCtrl.cleanup();
+        if (sourceErr.name === 'AbortError') {
+          console.error(`Source fetch timeout for ${safeDest} part=${partNumber} attempt=${attempt}/${maxAttempts}`);
+          if (attempt < maxAttempts) {
+            await sleep(backoffMs(attempt));
+            continue;
+          }
+          throw createHttpError(504, `Source fetch timeout for ${safeDest} part=${partNumber}`);
+        }
+        throw sourceErr;
+      }
     }
 
     throw createHttpError(502, `Upload failed after retries for ${safeDest} part=${partNumber}`);
   } catch (error) {
     console.error(`Processing failed for ${safeDest} (part ${partNumber}). Error: ${error.message}. source=${fileUrl}`);
-    throw error; // Re-throw to be handled by caller
+    throw error;
   }
 }
 
@@ -315,7 +360,6 @@ async function processMessage(task, env) {
   const { r2Key, size, offset, s3Url, uploadId, partNumber } = task;
 
   try {
-    // Validate required environment variables for source
     if (!env.SOURCE_ACCESS_KEY_ID || !env.SOURCE_SECRET_ACCESS_KEY) {
       throw new Error("Missing required environment variables: SOURCE_ACCESS_KEY_ID and SOURCE_SECRET_ACCESS_KEY must be set in wrangler.toml or as environment variables");
     }
@@ -334,7 +378,6 @@ async function processMessage(task, env) {
     }
     const sourceUrl = new URL(r2KeyUrl);
 
-    // Initialize AwsClient for Source (Read)
     const sourceAwsClient = new AwsClient({
       accessKeyId: env.SOURCE_ACCESS_KEY_ID,
       secretAccessKey: env.SOURCE_SECRET_ACCESS_KEY,
@@ -343,7 +386,6 @@ async function processMessage(task, env) {
       ...(sourceEndpoint ? { endpoint: sourceEndpoint } : {}),
     });
 
-    // Initialize AwsClient for Destination (Write)
     const s3Host = new URL(s3Url).hostname;
     const destAccessKey = env[s3Host + "_ak"] || env.AWS_ACCESS_KEY_ID;
     const destSecretKey = env[s3Host + "_sk"] || env.AWS_SECRET_ACCESS_KEY;
@@ -359,77 +401,109 @@ async function processMessage(task, env) {
       service: "s3",
     });
 
-    // 1. Download range from Source R2 (using S3 API)
     const uploadUrl = new URL(s3Url);
 
-    // If partNumber is -1, perform a standard PUT object upload
     if (partNumber !== -1) {
       uploadUrl.searchParams.set("partNumber", partNumber);
       uploadUrl.searchParams.set("uploadId", uploadId);
     }
 
     const safeKey = redactDestUrl(r2Key, partNumber);
-    const maxAttempts = Math.max(1, Number.parseInt(env?.UPLOAD_RETRY_ATTEMPTS || "3", 10) || 3)
+    const maxAttempts = Math.max(1, Number.parseInt(env?.UPLOAD_RETRY_ATTEMPTS || "3", 10) || 3);
+    const DEFAULT_TIMEOUT = 60000;
+    const timeoutMs = Number.parseInt(env?.FETCH_TIMEOUT_MS || "60000", 10) || DEFAULT_TIMEOUT;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const sourceResponse = await sourceAwsClient.fetch(sourceUrl, {
-        method: 'GET',
-        headers: {
-          'Range': `bytes=${offset}-${offset + size - 1}`
-        }
-      });
+      const sourceTimeoutCtrl = createTimeoutController(timeoutMs);
+      try {
+        const sourceResponse = await sourceAwsClient.fetch(sourceUrl, {
+          method: 'GET',
+          headers: {
+            'Range': `bytes=${offset}-${offset + size - 1}`
+          },
+          signal: sourceTimeoutCtrl.controller.signal
+        });
+        sourceTimeoutCtrl.cleanup();
 
-      if (!sourceResponse.ok) {
-        if (isRetryableStatus(sourceResponse.status) && attempt < maxAttempts) {
-          console.error(`Source download failed for ${safeKey} part=${partNumber} attempt=${attempt}/${maxAttempts} status=${sourceResponse.status}`)
-          await sleep(backoffMs(attempt));
-          continue;
+        if (!sourceResponse.ok) {
+          if (isRetryableStatus(sourceResponse.status) && attempt < maxAttempts) {
+            console.error(`Source download failed for ${safeKey} part=${partNumber} attempt=${attempt}/${maxAttempts} status=${sourceResponse.status}`)
+            await sleep(backoffMs(attempt));
+            continue;
+          }
+          throw createHttpError(502, `Failed to download from source: ${sourceResponse.status}`);
         }
-        throw new Error(`Failed to download from source: ${sourceResponse.status}`);
+
+        if (!sourceResponse.body) {
+          if (attempt < maxAttempts) {
+            console.error(`Source response missing body for ${safeKey} part=${partNumber} attempt=${attempt}/${maxAttempts}`)
+            await sleep(backoffMs(attempt));
+            continue;
+          }
+          throw createHttpError(502, "Source response has no body");
+        }
+
+        const signedRequest = await destAwsClient.sign(uploadUrl.toString(), {
+          method: "PUT",
+          headers: {
+            "Content-Length": size.toString(),
+            "X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
+          },
+        });
+
+        const uploadTimeoutCtrl = createTimeoutController(timeoutMs);
+        try {
+          const s3Response = await fetch(uploadUrl.toString(), {
+            method: "PUT",
+            body: sourceResponse.body,
+            headers: signedRequest.headers,
+            signal: uploadTimeoutCtrl.controller.signal
+          });
+          uploadTimeoutCtrl.cleanup();
+
+          if (!s3Response.ok) {
+            const errorText = await s3Response.text();
+            if (isRetryableStatus(s3Response.status) && attempt < maxAttempts) {
+              console.error(`Upload failed for ${safeKey} part=${partNumber} attempt=${attempt}/${maxAttempts} status=${s3Response.status} body=${errorText}`)
+              await sleep(backoffMs(attempt));
+              continue;
+            }
+            throw createHttpError(502, `Failed to upload to S3: ${s3Response.status} ${errorText}`);
+          }
+
+          const etag = s3Response.headers.get("etag") || s3Response.headers.get("ETag");
+          console.log(`Copy success for ${safeKey} part=${partNumber} etag=${etag || ""}`)
+          return { etag };
+        } catch (uploadErr) {
+          uploadTimeoutCtrl.cleanup();
+          if (uploadErr.name === 'AbortError') {
+            console.error(`Upload timeout for ${safeKey} part=${partNumber} attempt=${attempt}/${maxAttempts}`);
+            if (attempt < maxAttempts) {
+              await sleep(backoffMs(attempt));
+              continue;
+            }
+            throw createHttpError(504, `Upload timeout for ${safeKey} part=${partNumber}`);
+          }
+          throw uploadErr;
+        }
+      } catch (sourceErr) {
+        sourceTimeoutCtrl.cleanup();
+        if (sourceErr.name === 'AbortError') {
+          console.error(`Source download timeout for ${safeKey} part=${partNumber} attempt=${attempt}/${maxAttempts}`);
+          if (attempt < maxAttempts) {
+            await sleep(backoffMs(attempt));
+            continue;
+          }
+          throw createHttpError(504, `Source download timeout for ${safeKey} part=${partNumber}`);
+        }
+        throw sourceErr;
       }
-
-      if (!sourceResponse.body) {
-        if (attempt < maxAttempts) {
-          console.error(`Source response missing body for ${safeKey} part=${partNumber} attempt=${attempt}/${maxAttempts}`)
-          await sleep(backoffMs(attempt));
-          continue;
-        }
-        throw new Error("Source response has no body");
-      }
-
-      const signedRequest = await destAwsClient.sign(uploadUrl.toString(), {
-        method: "PUT",
-        headers: {
-          "Content-Length": size.toString(),
-          "X-Amz-Content-Sha256": "UNSIGNED-PAYLOAD",
-        },
-      });
-
-      const s3Response = await fetch(uploadUrl.toString(), {
-        method: "PUT",
-        body: sourceResponse.body,
-        headers: signedRequest.headers,
-      });
-
-      if (!s3Response.ok) {
-        const errorText = await s3Response.text();
-        if (isRetryableStatus(s3Response.status) && attempt < maxAttempts) {
-          console.error(`Upload failed for ${safeKey} part=${partNumber} attempt=${attempt}/${maxAttempts} status=${s3Response.status} body=${errorText}`)
-          await sleep(backoffMs(attempt));
-          continue;
-        }
-        throw new Error(`Failed to upload to S3: ${s3Response.status} ${errorText}`);
-      }
-
-      const etag = s3Response.headers.get("etag") || s3Response.headers.get("ETag");
-      console.log(`Copy success for ${safeKey} part=${partNumber} etag=${etag || ""}`)
-      return { etag };
     }
 
     throw new Error(`Copy failed after retries for ${safeKey} part=${partNumber}`);
   } catch (error) {
     const safeKey = redactDestUrl(r2Key, partNumber);
     console.error(`Processing failed for ${safeKey} (part ${partNumber}). Error: ${error.message}`);
-    throw error; // Re-throw to be handled by caller
+    throw error;
   }
 }

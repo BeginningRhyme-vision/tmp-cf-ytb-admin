@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -132,7 +133,7 @@ func updateJobStatus(jobID uint, status string, lastScanTime *time.Time, msg str
 	reqObj, _ := http.NewRequest("PATCH", fmt.Sprintf("%s/jobs/%d/status", apiBaseURL, jobID), bytes.NewBuffer(data))
 	reqObj.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(reqObj)
+	resp, err := httpClient.Do(reqObj)
 	if err != nil {
 		return err
 	}
@@ -415,6 +416,17 @@ func initSourceS3() (*s3.Client, error) {
 
 	baseEndpoint := fmt.Sprintf("%s://%s", u.Scheme, host)
 
+	httpTransport := &http.Transport{
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 64,
+		IdleConnTimeout:     60 * time.Second,
+		ForceAttemptHTTP2:   true,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+
 	c, err := awsconfig.LoadDefaultConfig(context.TODO(),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
 			cfg.Storage.Src.AccessKey,
@@ -422,6 +434,10 @@ func initSourceS3() (*s3.Client, error) {
 			"",
 		)),
 		awsconfig.WithRegion("auto"),
+		awsconfig.WithHTTPClient(&http.Client{
+			Transport: httpTransport,
+			Timeout:   60 * time.Second,
+		}),
 	)
 	if err != nil {
 		return nil, err

@@ -21,6 +21,12 @@ routes = [
 # SOURCE_ACCESS_KEY_ID = "source_access_key"
 # SOURCE_SECRET_ACCESS_KEY = "source_secret_key"
 
+# Timeout Configuration
+# FETCH_TIMEOUT_MS = "60000" # Default: 60000ms (60 seconds), timeout for fetch operations
+
+# Retry Configuration
+# UPLOAD_RETRY_ATTEMPTS = "3" # Default: 3, max retry attempts for failed uploads
+
 [placement]
 mode = "smart"
 

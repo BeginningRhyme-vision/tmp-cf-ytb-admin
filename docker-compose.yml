@@ -158,6 +158,8 @@ services:
     build:
       context: ./backend/worker_transfer
     command: ["transfer"]
+    ports:
+      - "9094:9094"
     environment:
       - BACKEND_API_URL=http://backend-api:8080/api
       - TRANSFER_MAX_WORKERS=128

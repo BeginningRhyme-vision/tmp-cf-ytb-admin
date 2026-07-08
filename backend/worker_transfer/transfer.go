@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,6 +65,7 @@ var (
 	jobCache                 sync.Map // JobID -> cachedJob
 	httpClient               *http.Client
 	transferClient           *http.Client
+	transferTransport        *http.Transport
 	workerCount              int
 	taskBufferSize           int
 	partConcurrency          int
@@ -202,7 +204,7 @@ func runTransfer() {
 		},
 	}
 
-	transferTransport := &http.Transport{
+	transferTransport = &http.Transport{
 		MaxIdleConns:        maxConnections,
 		MaxIdleConnsPerHost: maxConnections / 2,
 		MaxConnsPerHost:     maxConnections,
@@ -222,6 +224,7 @@ func runTransfer() {
 
 	initSourceClient()
 	initStatsFlusher()
+	initConnPoolMetrics()
 
 	log.Println("Transfer Worker Started")
 
@@ -330,6 +333,63 @@ func flushStats() {
 
 	for jobID, delta := range snapshot {
 		sendJobStatsUpdate(jobID, delta.Success, delta.Failed)
+	}
+}
+
+func initConnPoolMetrics() {
+	go func() {
+		shutdownWg.Add(1)
+		defer shutdownWg.Done()
+
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				log.Println("ConnPool metrics collector stopping...")
+				return
+			case <-ticker.C:
+				updateConnPoolMetrics()
+			}
+		}
+	}()
+}
+
+func updateConnPoolMetrics() {
+	if transferTransport == nil {
+		return
+	}
+
+	t := reflect.ValueOf(transferTransport).Elem()
+
+	active := getIntField(t, "numActive")
+	idle := getIntField(t, "numIdle")
+	waitCount := getIntField(t, "waitCount")
+
+	ConnPoolActiveGauge.WithLabelValues("transfer").Set(float64(active))
+	ConnPoolIdleGauge.WithLabelValues("transfer").Set(float64(idle))
+	ConnPoolWaitCounter.WithLabelValues("transfer").Add(float64(waitCount))
+
+	maxConns := transferTransport.MaxConnsPerHost
+	if maxConns > 0 {
+		usage := float64(active) / float64(maxConns)
+		ConnPoolUsageGauge.WithLabelValues("transfer").Set(usage)
+	}
+}
+
+func getIntField(v reflect.Value, name string) int {
+	f := v.FieldByName(name)
+	if !f.IsValid() {
+		return 0
+	}
+	switch f.Kind() {
+	case reflect.Int, reflect.Int32, reflect.Int64:
+		return int(f.Int())
+	case reflect.Uint, reflect.Uint32, reflect.Uint64:
+		return int(f.Uint())
+	default:
+		return 0
 	}
 }
 

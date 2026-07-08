@@ -124,6 +124,19 @@ var (
 	lastDecreaseTime        time.Time
 	lastDecreaseTimeMutex   sync.Mutex
 
+	// Log throttling - limit slot status logs to avoid spamming
+	lastSlotLogTime         time.Time
+	slotLogThrottleSecs     int
+	slotLogMutex            sync.Mutex
+
+	// Large file concurrency control
+	largeFileThresholdBytes  int64
+	maxLargeFiles            int
+	maxRetryLargeFiles       int
+	activeLargeFileCount     int32
+	activeSmallFileCount     int32
+	activeRetryLargeFileCount int32
+
 	// Metrics
 	BytesTransferred = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "transfer_bytes_transferred_total",
@@ -208,6 +221,10 @@ const (
 	DefaultConcurrencyAdjustIntervalSecs  = 10
 	DefaultConcurrencyCooldownSecs        = 30
 	DefaultMaxLatencySamples              = 500
+
+	DefaultLargeFileThresholdMB           = 1000
+	DefaultMaxLargeFiles                  = 4
+	DefaultMaxRetryLargeFiles             = 4
 )
 
 func runTransfer() {
@@ -259,6 +276,11 @@ func runTransfer() {
 	concurrencyAdjustIntervalSecs = getEnvInt("TRANSFER_CONCURRENCY_ADJUST_INTERVAL_SECS", DefaultConcurrencyAdjustIntervalSecs)
 	concurrencyCooldownSecs = getEnvInt("TRANSFER_CONCURRENCY_COOLDOWN_SECS", DefaultConcurrencyCooldownSecs)
 	maxLatencySamples = getEnvInt("TRANSFER_MAX_LATENCY_SAMPLES", DefaultMaxLatencySamples)
+	slotLogThrottleSecs = getEnvInt("TRANSFER_SLOT_LOG_THROTTLE_SECS", 15)
+
+	largeFileThresholdBytes = int64(getEnvInt("TRANSFER_LARGE_FILE_THRESHOLD_MB", DefaultLargeFileThresholdMB)) * 1024 * 1024
+	maxLargeFiles = getEnvInt("TRANSFER_MAX_LARGE_FILES", DefaultMaxLargeFiles)
+	maxRetryLargeFiles = getEnvInt("TRANSFER_MAX_RETRY_LARGE_FILES", DefaultMaxRetryLargeFiles)
 
 	if minWorkers > maxWorkers {
 		minWorkers = maxWorkers
@@ -386,7 +408,7 @@ func runTransfer() {
 	log.Println("Transfer Worker stopped gracefully")
 }
 
-func calculateDynamicTimeout(size int64) time.Duration {
+func calculateDynamicTimeout(size int64, retryCount int) time.Duration {
 	minTimeout := time.Duration(minTimeoutSecs) * time.Second
 	maxTimeout := time.Duration(maxTimeoutSecs) * time.Second
 
@@ -399,6 +421,12 @@ func calculateDynamicTimeout(size int64) time.Duration {
 	}
 
 	calculated := time.Duration(size/(int64(minThroughputMBPS)*1024*1024)) * time.Second
+	
+	if retryCount > 0 {
+		retryMultiplier := float64(int64(1) << uint(retryCount))
+		calculated = time.Duration(float64(calculated) * retryMultiplier)
+	}
+
 	if calculated < minTimeout {
 		return minTimeout
 	}
@@ -409,7 +437,7 @@ func calculateDynamicTimeout(size int64) time.Duration {
 }
 
 func calculatePartTimeout(partSize int64) time.Duration {
-	return calculateDynamicTimeout(partSize)
+	return calculateDynamicTimeout(partSize, 0)
 }
 
 func acquireWorkerSlot() bool {
@@ -450,23 +478,42 @@ func acquirePartSlot(sem chan struct{}) bool {
 	}
 	effective := atomic.LoadInt32(&effectivePartConcurrency)
 	if effective <= 0 {
-		log.Printf("[Adaptive] Part slot REJECTED: effective=%d (disabled)", effective)
+		if shouldLogSlotStatus() {
+			log.Printf("[Adaptive] Part slot REJECTED: effective=%d (disabled)", effective)
+		}
 		return false
 	}
 	select {
 	case sem <- struct{}{}:
-		log.Printf("[Adaptive] Part slot ACQUIRED: effective=%d", effective)
+		if shouldLogSlotStatus() {
+			log.Printf("[Adaptive] Part slot ACQUIRED: effective=%d", effective)
+		}
 		return true
 	default:
 		select {
 		case sem <- struct{}{}:
-			log.Printf("[Adaptive] Part slot ACQUIRED (delayed): effective=%d", effective)
+			if shouldLogSlotStatus() {
+				log.Printf("[Adaptive] Part slot ACQUIRED (delayed): effective=%d", effective)
+			}
 			return true
 		default:
-			log.Printf("[Adaptive] Part slot REJECTED: semaphore full, effective=%d", effective)
+			if shouldLogSlotStatus() {
+				log.Printf("[Adaptive] Part slot REJECTED: semaphore full, effective=%d", effective)
+			}
 			return false
 		}
 	}
+}
+
+func shouldLogSlotStatus() bool {
+	slotLogMutex.Lock()
+	defer slotLogMutex.Unlock()
+	now := time.Now()
+	if now.Sub(lastSlotLogTime).Seconds() >= float64(slotLogThrottleSecs) {
+		lastSlotLogTime = now
+		return true
+	}
+	return false
 }
 
 func recordTransferLatency(latencyMs int64) {
@@ -871,6 +918,64 @@ func processTask(t TransferTask) {
 
 	log.Printf("Processing Task %d (Job %d): %s -> %s", t.ID, t.JobID, t.Src, dstDir)
 
+	if t.Size >= largeFileThresholdBytes {
+		isRetry := t.RetryCount > 0
+		for {
+			if atomic.LoadInt32(&activeSmallFileCount) == 0 {
+				if isRetry {
+					current := atomic.LoadInt32(&activeRetryLargeFileCount)
+					if current < int32(maxRetryLargeFiles) {
+						if atomic.CompareAndSwapInt32(&activeRetryLargeFileCount, current, current+1) {
+							atomic.AddInt32(&activeLargeFileCount, 1)
+							log.Printf("[LargeFile] Task %d (%d bytes, retry=%d) acquired retry slot in unlimited mode (%d/%d)",
+								t.ID, t.Size, t.RetryCount, current+1, maxRetryLargeFiles)
+							defer func() {
+								atomic.AddInt32(&activeLargeFileCount, -1)
+								atomic.AddInt32(&activeRetryLargeFileCount, -1)
+							}()
+							break
+						}
+					} else {
+						log.Printf("[LargeFile] Task %d (%d bytes, retry=%d) waiting for retry slot in unlimited mode (%d/%d)",
+							t.ID, t.Size, t.RetryCount, current, maxRetryLargeFiles)
+					}
+				} else {
+					atomic.AddInt32(&activeLargeFileCount, 1)
+					log.Printf("[LargeFile] Task %d (%d bytes) acquired slot in unlimited mode (first attempt)", t.ID, t.Size)
+					defer atomic.AddInt32(&activeLargeFileCount, -1)
+					break
+				}
+			} else {
+				current := atomic.LoadInt32(&activeLargeFileCount)
+				if current < int32(maxLargeFiles) {
+					if atomic.CompareAndSwapInt32(&activeLargeFileCount, current, current+1) {
+						if isRetry {
+							atomic.AddInt32(&activeRetryLargeFileCount, 1)
+							log.Printf("[LargeFile] Task %d (%d bytes, retry=%d) acquired large file slot (%d/%d), small files active",
+								t.ID, t.Size, t.RetryCount, current+1, maxLargeFiles)
+							defer func() {
+								atomic.AddInt32(&activeLargeFileCount, -1)
+								atomic.AddInt32(&activeRetryLargeFileCount, -1)
+							}()
+						} else {
+							log.Printf("[LargeFile] Task %d (%d bytes) acquired large file slot (%d/%d), small files active",
+								t.ID, t.Size, current+1, maxLargeFiles)
+							defer atomic.AddInt32(&activeLargeFileCount, -1)
+						}
+						break
+					}
+				} else {
+					log.Printf("[LargeFile] Task %d (%d bytes, retry=%d) waiting for large file slot (%d/%d), small files active",
+						t.ID, t.Size, t.RetryCount, current, maxLargeFiles)
+				}
+			}
+			time.Sleep(5 * time.Second)
+		}
+	} else {
+		atomic.AddInt32(&activeSmallFileCount, 1)
+		defer atomic.AddInt32(&activeSmallFileCount, -1)
+	}
+
 	// 1. Resolve Dst Client
 	sk := job.Metadata.SKEncrypted
 	if strings.HasPrefix(sk, "enc_") {
@@ -948,8 +1053,8 @@ func processTask(t TransferTask) {
 	dstBucket := getBucketFromEndpoint(job.Metadata.Endpoint)
 	log.Printf("Task %d: Transferring %d bytes to bucket '%s' key '%s'", t.ID, size, dstBucket, dstKey)
 
-	taskTimeout := calculateDynamicTimeout(size)
-	log.Printf("Task %d: Calculated dynamic timeout: %v", t.ID, taskTimeout)
+	taskTimeout := calculateDynamicTimeout(size, t.RetryCount)
+	log.Printf("Task %d: Calculated dynamic timeout: %v (retry=%d)", t.ID, taskTimeout, t.RetryCount)
 
 	taskCtx, taskCancel := context.WithTimeout(shutdownCtx, taskTimeout)
 	defer taskCancel()

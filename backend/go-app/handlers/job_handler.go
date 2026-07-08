@@ -158,6 +158,32 @@ func GetTransferJob(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Job not found"})
 		return
 	}
+
+	var counts struct {
+		Total    int64
+		Pending  int64
+		Running  int64
+		Success  int64
+		Failed   int64
+	}
+
+	database.DB.Model(&models.TransferTask{}).
+		Where("job_id = ?", id).
+		Select(`
+			COUNT(*) as total,
+			SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) as pending,
+			SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END) as running,
+			SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as success,
+			SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed
+		`).
+		Scan(&counts)
+
+	job.TotalCount = int(counts.Total)
+	job.PendingCount = int(counts.Pending)
+	job.RunningCount = int(counts.Running)
+	job.SuccessCount = int(counts.Success)
+	job.FailedCount = int(counts.Failed)
+
 	c.JSON(http.StatusOK, job)
 }
 
@@ -232,6 +258,26 @@ func RetryTransferTasksLogic(jobID int, initialStatus models.JobStatus) {
 
 // 【旧逻辑】保持原样，专门处理旧任务
 // 【新逻辑】处理分片任务
+
+// resetFailedTaskForRetry resets a FAILED task to PENDING state for retry.
+// Returns true if the task was reset, false if it was not in FAILED state.
+// This is the single source of truth for task reset logic used by both
+// sharded and legacy retry paths, as well as the /transfer-tasks/reset API.
+func resetFailedTaskForRetry(task *models.TransferTask) bool {
+	if task.Status != "FAILED" {
+		return false
+	}
+	task.Status = "PENDING"
+	task.UpdatedAt = time.Now()
+	task.ErrorMessage = ""
+	task.WorkerID = ""
+	task.StartedAt = time.Time{}
+	task.CompletedAt = time.Time{}
+	task.RetryCount = 0
+	task.LastRetryTime = ""
+	return true
+}
+
 func retryShardedTransferTasks(ctx context.Context, jobID int, initialStatus models.JobStatus) {
 	resetCount := 0
 
@@ -287,11 +333,7 @@ func retryShardedTransferTasks(ctx context.Context, jobID int, initialStatus mod
 
 				var task models.TransferTask
 				if err := json.Unmarshal([]byte(str), &task); err == nil {
-					if task.Status == "FAILED" {
-						task.Status = "PENDING"
-						task.UpdatedAt = time.Now()
-						task.ErrorMessage = ""
-
+					if resetFailedTaskForRetry(&task) {
 						data, _ := json.Marshal(task)
 						pipe.Set(ctx, batchKeys[k], data, 0)
 						hasUpdates = true
@@ -355,11 +397,7 @@ func retryLegacyTransferTasks(jobID int, initialStatus models.JobStatus) {
 
 			var task models.TransferTask
 			if err := json.Unmarshal([]byte(str), &task); err == nil {
-				if task.Status == "FAILED" {
-					task.Status = "PENDING"
-					task.UpdatedAt = time.Now()
-					task.ErrorMessage = ""
-
+				if resetFailedTaskForRetry(&task) {
 					data, _ := json.Marshal(task)
 					pipe.Set(ctx, keys[i], data, 0)
 					hasUpdates = true

@@ -2314,6 +2314,8 @@ func ResetTransferTask(c *gin.Context) {
 		task.StartedAt = time.Time{}
 		task.CompletedAt = time.Time{}
 		task.ErrorMessage = ""
+		task.RetryCount = 0
+		task.LastRetryTime = ""
 		task.UpdatedAt = time.Now()
 
 		data, err := json.Marshal(task)

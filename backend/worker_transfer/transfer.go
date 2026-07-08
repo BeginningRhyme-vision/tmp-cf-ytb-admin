@@ -282,6 +282,9 @@ func runTransfer() {
 	maxLargeFiles = getEnvInt("TRANSFER_MAX_LARGE_FILES", DefaultMaxLargeFiles)
 	maxRetryLargeFiles = getEnvInt("TRANSFER_MAX_RETRY_LARGE_FILES", DefaultMaxRetryLargeFiles)
 
+	if largeFileThresholdBytes < 1 {
+		largeFileThresholdBytes = int64(DefaultLargeFileThresholdMB) * 1024 * 1024
+	}
 	if maxLargeFiles < 1 {
 		maxLargeFiles = 1
 	}
@@ -430,7 +433,11 @@ func calculateDynamicTimeout(size int64, retryCount int) time.Duration {
 	calculated := time.Duration(size/(int64(minThroughputMBPS)*1024*1024)) * time.Second
 	
 	if retryCount > 0 {
-		retryMultiplier := float64(int64(1) << uint(retryCount))
+		shift := retryCount
+		if shift > 30 {
+			shift = 30
+		}
+		retryMultiplier := float64(int64(1) << uint(shift))
 		calculated = time.Duration(float64(calculated) * retryMultiplier)
 	}
 

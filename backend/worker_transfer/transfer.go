@@ -1430,20 +1430,28 @@ func acquireTasks() ([]TransferTask, error) {
 	}
 	data, _ := json.Marshal(payload)
 
-	resp, err := httpClient.Post(apiBaseURL+"/transfer-tasks/acquire", "application/json", bytes.NewBuffer(data))
+	url := apiBaseURL + "/transfer-tasks/acquire"
+	log.Printf("[acquireTasks] POST %s with limit=%d", url, taskBufferSize)
+
+	resp, err := httpClient.Post(url, "application/json", bytes.NewBuffer(data))
 	if err != nil {
+		log.Printf("[acquireTasks] Error POST %s: %v", url, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		log.Printf("[acquireTasks] Status %d from %s", resp.StatusCode, url)
 		return nil, fmt.Errorf("status %d", resp.StatusCode)
 	}
 
 	var tasks []TransferTask
 	if err := json.NewDecoder(resp.Body).Decode(&tasks); err != nil {
+		log.Printf("[acquireTasks] Error decoding response from %s: %v", url, err)
 		return nil, err
 	}
+
+	log.Printf("[acquireTasks] Got %d tasks from %s", len(tasks), url)
 	return tasks, nil
 }
 

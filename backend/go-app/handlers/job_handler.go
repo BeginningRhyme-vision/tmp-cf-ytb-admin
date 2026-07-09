@@ -211,6 +211,9 @@ func StartTransferJob(c *gin.Context) {
 		return
 	}
 
+	ensureTxBuffer(int64(job.JobID))
+	triggerTxRefill(int64(job.JobID))
+
 	c.JSON(http.StatusOK, job)
 }
 

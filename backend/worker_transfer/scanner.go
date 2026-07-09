@@ -98,7 +98,7 @@ func runScanner() {
 		}
 
 		if len(jobs) == 0 {
-			time.Sleep(5 * time.Second)
+			time.Sleep(2 * time.Second)
 			continue
 		}
 
@@ -113,7 +113,7 @@ func runScanner() {
 			}(job)
 		}
 
-		time.Sleep(5 * time.Second)
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -204,7 +204,7 @@ func processJob(job TransferJob) {
 		var internalBatch []TransferTaskInput
 		for task := range taskChan {
 			internalBatch = append(internalBatch, task)
-			if len(internalBatch) >= 700 {
+			if len(internalBatch) >= 100 {
 				if err := sendBatch(job.JobID, internalBatch); err != nil {
 					log.Printf("Failed to send batch for job %d: %v", job.JobID, err)
 				}
@@ -338,13 +338,8 @@ func processJob(job TransferJob) {
 			lastUpdate = time.Now()
 		}
 
-		// Add a small delay between pages to reduce request rate after encountering rate limiting
-		// We track whether the last page request was affected by rate limiting
 		if pages > 0 {
-			// In case we've had a rate limiting event recently, apply a small delay
-			// This is a proactive measure to prevent subsequent rate limiting
-			standardDelay := 100 * time.Millisecond
-			//log.Printf("Waiting %v before requesting next page for job %d to prevent rate limiting", standardDelay, job.JobID)
+			standardDelay := 50 * time.Millisecond
 			time.Sleep(standardDelay)
 		}
 	}

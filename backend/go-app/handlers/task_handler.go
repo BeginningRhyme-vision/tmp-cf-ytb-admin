@@ -1571,8 +1571,14 @@ func addShardedTransferTasks(jobID int64, inputs []TransferTaskInput) (int, erro
 
 	// 4. 批量写入 PostgreSQL (transfer_tasks 表)
 	if len(tasks) > 0 {
-		if err := database.DB.Create(&tasks).Error; err != nil {
-			log.Printf("ERROR: Failed to insert tasks into transfer_tasks table for job %d: %v", jobID, err)
+		for _, task := range tasks {
+			result := database.DB.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "id"}},
+				DoNothing: true,
+			}).Create(&task)
+			if result.Error != nil {
+				log.Printf("[AddTasks] Failed to insert task %d for job %d: %v", task.ID, jobID, result.Error)
+			}
 		}
 	}
 
@@ -1695,8 +1701,14 @@ func addLegacyTransferTasks(jobID int64, inputs []TransferTaskInput) (int, error
 
 	// 4. 批量写入 PostgreSQL (transfer_tasks 表)
 	if len(tasks) > 0 {
-		if err := database.DB.Create(&tasks).Error; err != nil {
-			log.Printf("ERROR: Failed to insert tasks into transfer_tasks table for job %d: %v", jobID, err)
+		for _, task := range tasks {
+			result := database.DB.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "id"}},
+				DoNothing: true,
+			}).Create(&task)
+			if result.Error != nil {
+				log.Printf("[AddTasks] Failed to insert task %d for job %d: %v", task.ID, jobID, result.Error)
+			}
 		}
 	}
 

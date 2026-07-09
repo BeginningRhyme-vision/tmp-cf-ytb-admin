@@ -1970,14 +1970,18 @@ func fillShardedTxBuffer(ctx context.Context, jobID int64) {
 		return
 	}
 
-	// 获取详情 (注意：这里需要兼容 Task Key 的格式，建议 MGET 时尝试两种格式，或者统一格式)
+	// 获取详情
 	var keys []string
 	for _, id := range ids {
 		keys = append(keys, fmt.Sprintf("tx:task:%d:%s", jobID, id))
 	}
 
+	log.Printf("[fillShardedTxBuffer] Job %d: Fetching %d task details with keys pattern tx:task:%d:*, first=%s, last=%s",
+		jobID, len(keys), jobID, ids[0], ids[len(ids)-1])
+
 	jsonList, err := database.RDB.MGet(ctx, keys...).Result()
 	if err != nil {
+		log.Printf("[fillShardedTxBuffer] Job %d: MGET error: %v", jobID, err)
 		return
 	}
 
@@ -1985,14 +1989,31 @@ func fillShardedTxBuffer(ctx context.Context, jobID int64) {
 	ch, exists := txJobBuffers[jobID]
 	bufferMutex.RUnlock()
 	if !exists {
-		return
+		ensureTxBuffer(jobID)
+		bufferMutex.RLock()
+		ch, exists = txJobBuffers[jobID]
+		bufferMutex.RUnlock()
+		if !exists {
+			return
+		}
 	}
 
 	processed := 0
 	var maxID int64 = 0
 
+	nilCount := 0
+	validCount := 0
+
 	for i, item := range jsonList {
+		// 必须先更新 maxID，即使 item 是 nil 或解析失败
+		var currentID int64
+		fmt.Sscanf(ids[i], "%d", &currentID)
+		if currentID > maxID {
+			maxID = currentID
+		}
+
 		if item == nil {
+			nilCount++
 			continue
 		}
 		str, ok := item.(string)
@@ -2002,45 +2023,30 @@ func fillShardedTxBuffer(ctx context.Context, jobID int64) {
 
 		var task models.TransferTask
 		if err := json.Unmarshal([]byte(str), &task); err == nil {
+			validCount++
 			if task.Status == "PENDING" {
 				select {
 				case ch <- task:
 					processed++
-					if task.ID > maxID {
-						maxID = task.ID
-					}
 				default:
-					// Buffer full, update maxID before exit
-					var currentID int64
-					fmt.Sscanf(ids[i], "%d", &currentID)
-					if currentID > maxID {
-						maxID = currentID
-					}
 					goto FINISH
 				}
-			} else {
-				// 就算不是 PENDING，也算处理过了（跳过），需要更新 offset
-				// 只是这里我们假设 ZRange 取出的都是有效 ID，如果这里 continue 了，
-				// 我们依然需要推进 maxID，否则会死循环卡在非 PENDING 任务上。
-				// 由于我们是按 ID 顺序读的，我们应该以 ids[i] 来更新 maxID
-				// 简单起见，我们在 FINISH 块用 ids 的最后一个值更新
 			}
-		}
-
-		// 辅助更新 maxID (以防上面的 task 解析失败或跳过)
-		var currentID int64
-		fmt.Sscanf(ids[i], "%d", &currentID)
-		if currentID > maxID {
-			maxID = currentID
 		}
 	}
 
+	log.Printf("[fillShardedTxBuffer] Job %d: MGET results - total=%d, nil=%d, valid=%d, processed=%d",
+		jobID, len(jsonList), nilCount, validCount, processed)
+
 FINISH:
 	if processed > 0 || maxID > lastTaskID {
-		// 如果 Buffer 满了提前退出，maxID 应该是已处理的最后一个。
-		// 如果全部处理完，maxID 是 ids 的最后一个。
 		if maxID > 0 {
 			database.RDB.Set(ctx, offsetKey, maxID, 0)
+		} else if processed > 0 {
+			// 如果 maxID 没更新（所有任务都不是 PENDING），但 processed > 0，
+			// 使用 lastTaskID + processed 作为新的 offset
+			newOffset := lastTaskID + int64(processed)
+			database.RDB.Set(ctx, offsetKey, newOffset, 0)
 		}
 	}
 }
@@ -2156,12 +2162,13 @@ func AcquireTransferTasks(c *gin.Context) {
 		ch, ok := txJobBuffers[jobIDs[0]]
 		bufferMutex.RUnlock()
 		if ok {
+		done:
 			for len(tasks) < req.Limit {
 				select {
 				case t := <-ch:
 					tasks = append(tasks, t)
 				default:
-					break
+					break done
 				}
 			}
 		}

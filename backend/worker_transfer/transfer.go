@@ -127,6 +127,11 @@ var (
 	// Log throttling - limit slot status logs to avoid spamming
 	lastWorkerSlotLogTime   time.Time
 	workerSlotLogMutex      sync.Mutex
+	
+	lastLargeFileWaitLogTime   time.Time
+	largeFileWaitLogMutex      sync.Mutex
+	lastTaskProcessLogTime     time.Time
+	taskProcessLogMutex        sync.Mutex
 	lastPartSlotLogTime     time.Time
 	partSlotLogMutex        sync.Mutex
 	slotLogThrottleSecs     int
@@ -224,7 +229,7 @@ const (
 	DefaultErrorRateThreshold             = 0.05
 	DefaultAvgLatencyThresholdMS          = 2000
 	DefaultConnPoolUtilizationThreshold   = 0.8
-	DefaultConcurrencyAdjustIntervalSecs  = 10
+	DefaultConcurrencyAdjustIntervalSecs  = 40
 	DefaultConcurrencyCooldownSecs        = 30
 	DefaultMaxLatencySamples              = 500
 
@@ -988,8 +993,10 @@ func processTask(t TransferTask) {
 			}
 			
 			if jobCurrent >= maxPerJob {
-				log.Printf("[LargeFile] Task %d (Job %d) waiting: job has %d large files, max per job=%d",
-					t.ID, t.JobID, jobCurrent, maxPerJob)
+				if shouldLogLargeFileWait() {
+					log.Printf("[LargeFile] Task %d (Job %d) waiting: job has %d large files, max per job=%d",
+						t.ID, t.JobID, jobCurrent, maxPerJob)
+				}
 				time.Sleep(5 * time.Second)
 				continue
 			}
@@ -1018,8 +1025,10 @@ func processTask(t TransferTask) {
 							break
 						}
 					} else {
-						log.Printf("[LargeFile] Task %d (Job %d, %d bytes, retry=%d) waiting for retry slot in unlimited mode (%d/%d)",
-							t.ID, t.JobID, t.Size, t.RetryCount, current, maxRetryLargeFiles)
+						if shouldLogLargeFileWait() {
+							log.Printf("[LargeFile] Task %d (Job %d, %d bytes, retry=%d) waiting for retry slot in unlimited mode (%d/%d)",
+								t.ID, t.JobID, t.Size, t.RetryCount, current, maxRetryLargeFiles)
+						}
 					}
 				} else {
 					atomic.AddInt32(&activeLargeFileCount, 1)
@@ -1076,8 +1085,10 @@ func processTask(t TransferTask) {
 						break
 					}
 				} else {
-					log.Printf("[LargeFile] Task %d (Job %d, %d bytes, retry=%d) waiting for large file slot (%d/%d), small files active",
-						t.ID, t.JobID, t.Size, t.RetryCount, current, maxLargeFiles)
+					if shouldLogLargeFileWait() {
+						log.Printf("[LargeFile] Task %d (Job %d, %d bytes, retry=%d) waiting for large file slot (%d/%d), small files active",
+							t.ID, t.JobID, t.Size, t.RetryCount, current, maxLargeFiles)
+					}
 				}
 			}
 			time.Sleep(5 * time.Second)
@@ -1782,4 +1793,37 @@ func resetTaskToPending(taskID int64) error {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func shouldLogLargeFileWait() bool {
+	largeFileWaitLogMutex.Lock()
+	defer largeFileWaitLogMutex.Unlock()
+	now := time.Now()
+	if now.Sub(lastLargeFileWaitLogTime) >= time.Duration(slotLogThrottleSecs)*time.Second {
+		lastLargeFileWaitLogTime = now
+		return true
+	}
+	return false
+}
+
+func shouldLogTaskProcess() bool {
+	taskProcessLogMutex.Lock()
+	defer taskProcessLogMutex.Unlock()
+	now := time.Now()
+	if now.Sub(lastTaskProcessLogTime) >= 5*time.Second {
+		lastTaskProcessLogTime = now
+		return true
+	}
+	return false
+}
+
+func shouldLogPartSlot() bool {
+	partSlotLogMutex.Lock()
+	defer partSlotLogMutex.Unlock()
+	now := time.Now()
+	if now.Sub(lastPartSlotLogTime) >= time.Duration(slotLogThrottleSecs)*time.Second {
+		lastPartSlotLogTime = now
+		return true
+	}
+	return false
 }

@@ -229,7 +229,7 @@ const (
 	DefaultErrorRateThreshold             = 0.05
 	DefaultAvgLatencyThresholdMS          = 2000
 	DefaultConnPoolUtilizationThreshold   = 0.8
-	DefaultConcurrencyAdjustIntervalSecs  = 40
+	DefaultConcurrencyAdjustIntervalSecs  = 10
 	DefaultConcurrencyCooldownSecs        = 30
 	DefaultMaxLatencySamples              = 500
 

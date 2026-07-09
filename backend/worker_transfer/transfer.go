@@ -146,8 +146,8 @@ var (
 	activeRetryLargeFileCount int32
 	
 	// Per-job large file tracking for fair distribution
-	jobLargeFileCounts  map[int64]int32
-	jobLargeFileMutex   sync.RWMutex
+	// Use sync.Map + atomic.Int32 to avoid global lock contention
+	jobLargeFileCounts  sync.Map
 
 	// Metrics
 	BytesTransferred = promauto.NewCounter(prometheus.CounterOpts{
@@ -312,7 +312,6 @@ func runTransfer() {
 	atomic.StoreInt32(&effectivePartConcurrency, int32(partConcurrency))
 	recentLatencies = list.New()
 	lastDecreaseTime = time.Unix(0, 0)
-	jobLargeFileCounts = make(map[int64]int32)
 
 	httpClient = &http.Client{
 		Timeout: 20 * time.Second,
@@ -995,13 +994,18 @@ func processTask(t TransferTask) {
 	if t.Size >= largeFileThresholdBytes {
 		isRetry := t.RetryCount > 0
 		for {
-			jobLargeFileMutex.RLock()
-			jobCount := len(jobLargeFileCounts)
+			jobCount := 0
+			jobLargeFileCounts.Range(func(key, value interface{}) bool {
+				jobCount++
+				return true
+			})
 			if jobCount == 0 {
 				jobCount = 1
 			}
-			jobCurrent := jobLargeFileCounts[t.JobID]
-			jobLargeFileMutex.RUnlock()
+			jobCurrent := int32(0)
+			if v, ok := jobLargeFileCounts.Load(t.JobID); ok {
+				jobCurrent = v.(int32)
+			}
 			
 			maxPerJob := int32(maxLargeFiles) / int32(jobCount)
 			if maxPerJob < 1 {
@@ -1026,20 +1030,36 @@ func processTask(t TransferTask) {
 					if current < int32(maxRetryLargeFiles) {
 						if atomic.CompareAndSwapInt32(&activeRetryLargeFileCount, current, current+1) {
 							atomic.AddInt32(&activeLargeFileCount, 1)
-							jobLargeFileMutex.Lock()
-							jobLargeFileCounts[t.JobID]++
-							jobLargeFileMutex.Unlock()
+							for {
+								if v, ok := jobLargeFileCounts.Load(t.JobID); ok {
+									if jobLargeFileCounts.CompareAndSwap(t.JobID, v, v.(int32)+1) {
+										break
+									}
+								} else {
+									if _, loaded := jobLargeFileCounts.LoadOrStore(t.JobID, int32(1)); loaded {
+										continue
+									}
+									break
+								}
+							}
 							log.Printf("[LargeFile] Task %d (Job %d, %d bytes, retry=%d) acquired retry slot in unlimited mode (%d/%d, job=%d/%d)",
 								t.ID, t.JobID, t.Size, t.RetryCount, current+1, maxRetryLargeFiles, jobCurrent+1, maxPerJob)
 							defer func() {
 								atomic.AddInt32(&activeLargeFileCount, -1)
 								atomic.AddInt32(&activeRetryLargeFileCount, -1)
-								jobLargeFileMutex.Lock()
-								jobLargeFileCounts[t.JobID]--
-								if jobLargeFileCounts[t.JobID] <= 0 {
-									delete(jobLargeFileCounts, t.JobID)
+								for {
+									if v, ok := jobLargeFileCounts.Load(t.JobID); ok {
+										newVal := v.(int32) - 1
+										if jobLargeFileCounts.CompareAndSwap(t.JobID, v, newVal) {
+											if newVal <= 0 {
+												jobLargeFileCounts.Delete(t.JobID)
+											}
+											break
+										}
+									} else {
+										break
+									}
 								}
-								jobLargeFileMutex.Unlock()
 							}()
 							break
 						}
@@ -1051,19 +1071,35 @@ func processTask(t TransferTask) {
 					}
 				} else {
 					atomic.AddInt32(&activeLargeFileCount, 1)
-					jobLargeFileMutex.Lock()
-					jobLargeFileCounts[t.JobID]++
-					jobLargeFileMutex.Unlock()
+					for {
+						if v, ok := jobLargeFileCounts.Load(t.JobID); ok {
+							if jobLargeFileCounts.CompareAndSwap(t.JobID, v, v.(int32)+1) {
+								break
+							}
+						} else {
+							if _, loaded := jobLargeFileCounts.LoadOrStore(t.JobID, int32(1)); loaded {
+								continue
+							}
+							break
+						}
+					}
 					log.Printf("[LargeFile] Task %d (Job %d, %d bytes) acquired slot in unlimited mode (first attempt, job=%d/%d)",
 						t.ID, t.JobID, t.Size, jobCurrent+1, maxPerJob)
 					defer func() {
 						atomic.AddInt32(&activeLargeFileCount, -1)
-						jobLargeFileMutex.Lock()
-						jobLargeFileCounts[t.JobID]--
-						if jobLargeFileCounts[t.JobID] <= 0 {
-							delete(jobLargeFileCounts, t.JobID)
+						for {
+							if v, ok := jobLargeFileCounts.Load(t.JobID); ok {
+								newVal := v.(int32) - 1
+								if jobLargeFileCounts.CompareAndSwap(t.JobID, v, newVal) {
+									if newVal <= 0 {
+										jobLargeFileCounts.Delete(t.JobID)
+									}
+									break
+								}
+							} else {
+								break
+							}
 						}
-						jobLargeFileMutex.Unlock()
 					}()
 					break
 				}
@@ -1071,9 +1107,18 @@ func processTask(t TransferTask) {
 				current := atomic.LoadInt32(&activeLargeFileCount)
 				if current < int32(maxLargeFiles) {
 					if atomic.CompareAndSwapInt32(&activeLargeFileCount, current, current+1) {
-						jobLargeFileMutex.Lock()
-						jobLargeFileCounts[t.JobID]++
-						jobLargeFileMutex.Unlock()
+						for {
+							if v, ok := jobLargeFileCounts.Load(t.JobID); ok {
+								if jobLargeFileCounts.CompareAndSwap(t.JobID, v, v.(int32)+1) {
+									break
+								}
+							} else {
+								if _, loaded := jobLargeFileCounts.LoadOrStore(t.JobID, int32(1)); loaded {
+									continue
+								}
+								break
+							}
+						}
 						if isRetry {
 							atomic.AddInt32(&activeRetryLargeFileCount, 1)
 							log.Printf("[LargeFile] Task %d (Job %d, %d bytes, retry=%d) acquired large file slot (%d/%d, job=%d/%d), small files active",
@@ -1081,24 +1126,38 @@ func processTask(t TransferTask) {
 							defer func() {
 								atomic.AddInt32(&activeLargeFileCount, -1)
 								atomic.AddInt32(&activeRetryLargeFileCount, -1)
-								jobLargeFileMutex.Lock()
-								jobLargeFileCounts[t.JobID]--
-								if jobLargeFileCounts[t.JobID] <= 0 {
-									delete(jobLargeFileCounts, t.JobID)
+								for {
+									if v, ok := jobLargeFileCounts.Load(t.JobID); ok {
+										newVal := v.(int32) - 1
+										if jobLargeFileCounts.CompareAndSwap(t.JobID, v, newVal) {
+											if newVal <= 0 {
+												jobLargeFileCounts.Delete(t.JobID)
+											}
+											break
+										}
+									} else {
+										break
+									}
 								}
-								jobLargeFileMutex.Unlock()
 							}()
 						} else {
 							log.Printf("[LargeFile] Task %d (Job %d, %d bytes) acquired large file slot (%d/%d, job=%d/%d), small files active",
 								t.ID, t.JobID, t.Size, current+1, maxLargeFiles, jobCurrent+1, maxPerJob)
 							defer func() {
 								atomic.AddInt32(&activeLargeFileCount, -1)
-								jobLargeFileMutex.Lock()
-								jobLargeFileCounts[t.JobID]--
-								if jobLargeFileCounts[t.JobID] <= 0 {
-									delete(jobLargeFileCounts, t.JobID)
+								for {
+									if v, ok := jobLargeFileCounts.Load(t.JobID); ok {
+										newVal := v.(int32) - 1
+										if jobLargeFileCounts.CompareAndSwap(t.JobID, v, newVal) {
+											if newVal <= 0 {
+												jobLargeFileCounts.Delete(t.JobID)
+											}
+											break
+										}
+									} else {
+										break
+									}
 								}
-								jobLargeFileMutex.Unlock()
 							}()
 						}
 						break

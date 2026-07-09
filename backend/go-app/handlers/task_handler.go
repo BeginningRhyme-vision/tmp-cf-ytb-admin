@@ -1740,8 +1740,10 @@ func checkAndRefillTxBuffers() {
 	// 查找状态为 Running 或 Pending 的 Job
 	// Pending 状态的 Job 也需要初始化 buffer，等 Scanner 创建任务后可以立即开始传输
 	if err := database.DB.Where("status IN ?", []models.JobStatus{models.StatusRunning, models.StatusPending}).Find(&jobs).Error; err != nil {
+		log.Printf("[checkAndRefillTxBuffers] Failed to query active jobs: %v", err)
 		return
 	}
+	log.Printf("[checkAndRefillTxBuffers] Found %d active transfer jobs", len(jobs))
 
 	ctx := context.Background()
 
@@ -2157,9 +2159,37 @@ func AcquireTransferTasks(c *gin.Context) {
 	log.Printf("[AcquireTransferTasks] Available job buffers: %v", jobIDs)
 
 	if len(jobIDs) == 0 {
-		log.Printf("[AcquireTransferTasks] No job buffers available, returning 0 tasks")
-		c.JSON(http.StatusOK, tasks)
-		return
+		log.Printf("[AcquireTransferTasks] No job buffers available, querying database for active jobs")
+
+		var jobs []models.TransferJob
+		if err := database.DB.Where("status IN ?", []models.JobStatus{models.StatusRunning, models.StatusPending}).Find(&jobs).Error; err != nil {
+			log.Printf("[AcquireTransferTasks] Failed to query active transfer jobs: %v", err)
+			c.JSON(http.StatusOK, tasks)
+			return
+		}
+
+		log.Printf("[AcquireTransferTasks] Found %d active transfer jobs in database", len(jobs))
+
+		for _, job := range jobs {
+			jid := int64(job.JobID)
+			ensureTxBuffer(jid)
+			log.Printf("[AcquireTransferTasks] Created buffer for job %d, pending=%d", jid, job.PendingCount)
+			triggerTxRefill(jid)
+		}
+
+		bufferMutex.RLock()
+		for jid := range txJobBuffers {
+			jobIDs = append(jobIDs, jid)
+		}
+		bufferMutex.RUnlock()
+
+		log.Printf("[AcquireTransferTasks] After initialization, available job buffers: %v", jobIDs)
+
+		if len(jobIDs) == 0 {
+			log.Printf("[AcquireTransferTasks] Still no job buffers available, returning 0 tasks")
+			c.JSON(http.StatusOK, tasks)
+			return
+		}
 	}
 
 	if len(jobIDs) == 1 {

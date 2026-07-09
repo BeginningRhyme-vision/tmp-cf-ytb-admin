@@ -76,11 +76,12 @@ func InitPostgres(cfg *config.Config) error {
 		&models.User{},
 		&models.TransferMetadata{},
 		&models.TransferJob{},
+		&models.TransferTask{},
 		&models.YoutubeJob{},
 		&models.FfmpegJob{},
 		&models.PipelineJob{},
 		&models.WorkerCookieConfig{},
-		&models.YoutubeTaskRecord{}, // 确保 YoutubeTaskRecord 在迁移列表中
+		&models.YoutubeTaskRecord{},
 	)
 	if err != nil {
 		log.Printf("ERROR: AutoMigrate failed: %v", err)

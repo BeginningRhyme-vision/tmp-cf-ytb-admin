@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -818,6 +819,11 @@ func flushStats() {
 		statsMutex.Unlock()
 		return
 	}
+	
+	log.Printf("[Stats] Active goroutines: %d, LargeFiles: %d, SmallFiles: %d",
+		runtime.NumGoroutine(),
+		atomic.LoadInt32(&activeLargeFileCount),
+		atomic.LoadInt32(&activeSmallFileCount))
 
 	snapshot := make(map[int64]JobStatsDelta)
 	for k, v := range statsBuffer {
@@ -937,6 +943,16 @@ func sendJobStatsUpdate(jobID int64, incSuccess, incFailed int) {
 
 func processTask(t TransferTask) {
 	start := time.Now()
+	
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[Panic] Task %d panicked: %v", t.ID, r)
+			updateTaskStatusWithRetry(t, "FAILED", "Panic: "+fmt.Sprintf("%v", r))
+			updateJobStats(t.JobID, 0, 1)
+			TasksTransferred.WithLabelValues("failed").Inc()
+			recordTransferResult(false)
+		}
+	}()
 
 	if t.RetryCount >= maxRetryCount {
 		log.Printf("Task %d has reached max retry count (%d), marking as permanently FAILED", t.ID, maxRetryCount)
@@ -992,10 +1008,13 @@ func processTask(t TransferTask) {
 				maxPerJob = 1
 			}
 			
-			if jobCurrent >= maxPerJob {
+			globalCurrent := atomic.LoadInt32(&activeLargeFileCount)
+			canProceed := jobCurrent < maxPerJob || globalCurrent < int32(maxLargeFiles)
+			
+			if !canProceed {
 				if shouldLogLargeFileWait() {
-					log.Printf("[LargeFile] Task %d (Job %d) waiting: job has %d large files, max per job=%d",
-						t.ID, t.JobID, jobCurrent, maxPerJob)
+					log.Printf("[LargeFile] Task %d (Job %d) waiting: job has %d large files, max per job=%d, global=%d/%d",
+						t.ID, t.JobID, jobCurrent, maxPerJob, globalCurrent, maxLargeFiles)
 				}
 				time.Sleep(5 * time.Second)
 				continue

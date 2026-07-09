@@ -1569,6 +1569,13 @@ func addShardedTransferTasks(jobID int64, inputs []TransferTaskInput) (int, erro
 		return 0, err
 	}
 
+	// 4. 批量写入 PostgreSQL (transfer_tasks 表)
+	if len(tasks) > 0 {
+		if err := database.DB.Create(&tasks).Error; err != nil {
+			log.Printf("ERROR: Failed to insert tasks into transfer_tasks table for job %d: %v", jobID, err)
+		}
+	}
+
 	var totalSizeBytes int64
 	for _, input := range newInputs {
 		if input.Size > 0 {
@@ -1684,6 +1691,13 @@ func addLegacyTransferTasks(jobID int64, inputs []TransferTaskInput) (int, error
 	_, err = pipe.Exec(ctx)
 	if err != nil {
 		return 0, err
+	}
+
+	// 4. 批量写入 PostgreSQL (transfer_tasks 表)
+	if len(tasks) > 0 {
+		if err := database.DB.Create(&tasks).Error; err != nil {
+			log.Printf("ERROR: Failed to insert tasks into transfer_tasks table for job %d: %v", jobID, err)
+		}
 	}
 
 	var totalSizeBytes int64

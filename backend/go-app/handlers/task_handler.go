@@ -53,6 +53,12 @@ const (
 	LockExpiration   = 30 * time.Second
 	DedupShards      = 256   // 去重 Hash 分成 256 片
 	TaskBucketSize   = 50000 // 任务 ZSet 每 5 万个 ID 分一个桶
+	TxBufferLogInterval = 10 * time.Second // Log every 10 seconds
+)
+
+var (
+	lastTxBufferLogTime time.Time
+	txBufferLogMutex    sync.Mutex
 )
 
 // 获取 job 模式
@@ -1719,15 +1725,27 @@ func addLegacyTransferTasks(jobID int64, inputs []TransferTaskInput) (int, error
 }
 
 // --- Transfer Task Buffer Logic ---
+func shouldLogTxBuffer() bool {
+	txBufferLogMutex.Lock()
+	defer txBufferLogMutex.Unlock()
+	now := time.Now()
+	if now.Sub(lastTxBufferLogTime) >= TxBufferLogInterval {
+		lastTxBufferLogTime = now
+		return true
+	}
+	return false
+}
+
 func checkAndRefillTxBuffers() {
 	var jobs []models.TransferJob
-	// 查找状态为 Running 或 Pending 的 Job
-	// Pending 状态的 Job 也需要初始化 buffer，等 Scanner 创建任务后可以立即开始传输
 	if err := database.DB.Where("status IN ?", []models.JobStatus{models.StatusRunning, models.StatusPending}).Find(&jobs).Error; err != nil {
 		log.Printf("[checkAndRefillTxBuffers] Failed to query active jobs: %v", err)
 		return
 	}
-	log.Printf("[checkAndRefillTxBuffers] Found %d active transfer jobs", len(jobs))
+
+	if shouldLogTxBuffer() {
+		log.Printf("[checkAndRefillTxBuffers] Found %d active transfer jobs", len(jobs))
+	}
 
 	ctx := context.Background()
 
@@ -1740,7 +1758,6 @@ func checkAndRefillTxBuffers() {
 		bufferMutex.RUnlock()
 
 		if !exists {
-			log.Printf("[checkAndRefillTxBuffers] Job %d: buffer does not exist, skipping", jid)
 			continue
 		}
 
@@ -1748,7 +1765,9 @@ func checkAndRefillTxBuffers() {
 		key := fmt.Sprintf("tx:%d", jid)
 		_, filling := fillingMap.Load(key)
 
-		log.Printf("[checkAndRefillTxBuffers] Job %d: bufferLen=%d, pending=%d, filling=%v", jid, bufferLen, job.PendingCount, filling)
+		if shouldLogTxBuffer() {
+			log.Printf("[checkAndRefillTxBuffers] Job %d: bufferLen=%d, pending=%d, filling=%v", jid, bufferLen, job.PendingCount, filling)
+		}
 
 		// 检查卡死状态: Pending > 0, Buffer Empty, Not Filling
 		if job.PendingCount > 0 && len(ch) == 0 {
@@ -1804,10 +1823,10 @@ func checkAndRefillTxBuffers() {
 		}
 
 		if len(ch) < BufferLowWater {
-			log.Printf("[checkAndRefillTxBuffers] Job %d: bufferLen=%d < BufferLowWater=%d, triggering refill", jid, len(ch), BufferLowWater)
+			if shouldLogTxBuffer() {
+				log.Printf("[checkAndRefillTxBuffers] Job %d: bufferLen=%d < BufferLowWater=%d, triggering refill", jid, len(ch), BufferLowWater)
+			}
 			triggerTxRefill(jid)
-		} else {
-			log.Printf("[checkAndRefillTxBuffers] Job %d: bufferLen=%d >= BufferLowWater=%d, skipping refill", jid, len(ch), BufferLowWater)
 		}
 	}
 }

@@ -1872,20 +1872,11 @@ func triggerTxRefill(jobID int64) {
 }
 func fillTxJobBuffer(jobID int64) {
 	ctx := context.Background()
-	// 统一使用旧 Key 格式做锁（兼容性好）
-	lockKey := fmt.Sprintf("tx:job:%d:lock", jobID)
 
-	ok, err := database.RDB.SetNX(ctx, lockKey, 1, LockExpiration).Result()
-	if err != nil || !ok {
-		return
-	}
-	defer database.RDB.Del(ctx, lockKey)
-
-	// 路由
 	if isJobSharded(ctx, jobID) {
-		fillShardedTxBuffer(ctx, jobID) // 【新】
+		fillShardedTxBuffer(ctx, jobID)
 	} else {
-		fillLeagcyTxJobBuffer(jobID) // 【旧】
+		fillLeagcyTxJobBuffer(jobID)
 	}
 }
 

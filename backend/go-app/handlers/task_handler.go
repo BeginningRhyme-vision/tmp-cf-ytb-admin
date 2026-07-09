@@ -1593,14 +1593,6 @@ func addShardedTransferTasks(jobID int64, inputs []TransferTaskInput) (int, erro
 			UpdateColumn("total_size_bytes", gorm.Expr("total_size_bytes + ?", totalSizeBytes))
 	}
 
-	if len(newInputs) > 0 {
-		database.DB.Model(&models.TransferJob{}).Where("job_id = ?", jobID).
-			Updates(map[string]interface{}{
-				"total_count":   gorm.Expr("total_count + ?", len(newInputs)),
-				"pending_count": gorm.Expr("pending_count + ?", len(newInputs)),
-			})
-	}
-
 	return len(tasks), nil
 }
 
@@ -1721,14 +1713,6 @@ func addLegacyTransferTasks(jobID int64, inputs []TransferTaskInput) (int, error
 	if totalSizeBytes > 0 {
 		database.DB.Model(&models.TransferJob{}).Where("job_id = ?", jobID).
 			UpdateColumn("total_size_bytes", gorm.Expr("total_size_bytes + ?", totalSizeBytes))
-	}
-
-	if len(newInputs) > 0 {
-		database.DB.Model(&models.TransferJob{}).Where("job_id = ?", jobID).
-			Updates(map[string]interface{}{
-				"total_count":   gorm.Expr("total_count + ?", len(newInputs)),
-				"pending_count": gorm.Expr("pending_count + ?", len(newInputs)),
-			})
 	}
 
 	return len(tasks), nil

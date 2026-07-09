@@ -60,9 +60,11 @@ func CreateTransferJob(c *gin.Context) {
 			for _, t := range tasks {
 				inputs = append(inputs, TransferTaskInput{Src: t, Size: 0})
 			}
-			_, err := AddTransferTasksToJob(int64(jobID), inputs)
+			count, err := AddTransferTasksToJob(int64(jobID), inputs)
 			if err != nil {
 				fmt.Printf("Error adding tasks for transfer job %d: %v\n", jobID, err)
+			} else if count > 0 {
+				database.DB.Exec("UPDATE transfer_jobs SET total_count = total_count + ?, pending_count = pending_count + ? WHERE job_id = ?", count, count, jobID)
 			}
 		}(job.JobID, req.Tasks)
 	}

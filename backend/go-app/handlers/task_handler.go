@@ -2264,7 +2264,10 @@ func AcquireTransferTasks(c *gin.Context) {
 			case t := <-ch:
 				if t.Size >= LargeFileThresholdBytes {
 					if largeCounts[jid] >= maxLargePerJob {
-						ch <- t
+						select {
+						case ch <- t:
+						default:
+						}
 						continue
 					}
 					largeCounts[jid]++

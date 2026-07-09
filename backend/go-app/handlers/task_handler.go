@@ -2006,12 +2006,16 @@ func fillShardedTxBuffer(ctx context.Context, jobID int64) {
 				select {
 				case ch <- task:
 					processed++
-					// 记录读取到的最大 ID
 					if task.ID > maxID {
 						maxID = task.ID
 					}
 				default:
-					// Buffer full
+					// Buffer full, update maxID before exit
+					var currentID int64
+					fmt.Sscanf(ids[i], "%d", &currentID)
+					if currentID > maxID {
+						maxID = currentID
+					}
 					goto FINISH
 				}
 			} else {

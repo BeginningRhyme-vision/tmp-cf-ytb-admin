@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"unbound-future-backend/database"
@@ -36,6 +37,9 @@ var (
 	statsBuffer     = make(map[int64]*JobDelta)
 	statsMutex      sync.Mutex
 	jobShardingMode sync.Map
+
+	// Counter for periodic database checks
+	txAcquireRequestCount int32
 )
 
 type JobDelta struct {
@@ -2172,9 +2176,10 @@ func AcquireTransferTasks(c *gin.Context) {
 
 	log.Printf("[AcquireTransferTasks] Available job buffers: %v", jobIDs)
 
-	if len(jobIDs) == 0 {
-		log.Printf("[AcquireTransferTasks] No job buffers available, querying database for active jobs")
+	atomic.AddInt32(&txAcquireRequestCount, 1)
+	shouldCheckDB := len(jobIDs) == 0 || atomic.LoadInt32(&txAcquireRequestCount)%30 == 0
 
+	if shouldCheckDB {
 		var jobs []models.TransferJob
 		if err := database.DB.Where("status IN ?", []models.JobStatus{models.StatusRunning, models.StatusPending}).Find(&jobs).Error; err != nil {
 			log.Printf("[AcquireTransferTasks] Failed to query active transfer jobs: %v", err)
@@ -2182,28 +2187,40 @@ func AcquireTransferTasks(c *gin.Context) {
 			return
 		}
 
-		log.Printf("[AcquireTransferTasks] Found %d active transfer jobs in database", len(jobs))
+		if len(jobs) > len(jobIDs) {
+			log.Printf("[AcquireTransferTasks] Found %d active transfer jobs in database, %d new jobs to initialize", len(jobs), len(jobs)-len(jobIDs))
 
-		for _, job := range jobs {
-			jid := int64(job.JobID)
-			ensureTxBuffer(jid)
-			log.Printf("[AcquireTransferTasks] Created buffer for job %d, pending=%d", jid, job.PendingCount)
-			triggerTxRefill(jid)
+			bufferMutex.Lock()
+			existingJobs := make(map[int64]bool)
+			for _, jid := range jobIDs {
+				existingJobs[jid] = true
+			}
+			bufferMutex.Unlock()
+
+			for _, job := range jobs {
+				jid := int64(job.JobID)
+				if !existingJobs[jid] {
+					ensureTxBuffer(jid)
+					log.Printf("[AcquireTransferTasks] Created buffer for job %d, pending=%d", jid, job.PendingCount)
+					triggerTxRefill(jid)
+				}
+			}
+
+			bufferMutex.RLock()
+			jobIDs = nil
+			for jid := range txJobBuffers {
+				jobIDs = append(jobIDs, jid)
+			}
+			bufferMutex.RUnlock()
+
+			log.Printf("[AcquireTransferTasks] After initialization, available job buffers: %v", jobIDs)
 		}
+	}
 
-		bufferMutex.RLock()
-		for jid := range txJobBuffers {
-			jobIDs = append(jobIDs, jid)
-		}
-		bufferMutex.RUnlock()
-
-		log.Printf("[AcquireTransferTasks] After initialization, available job buffers: %v", jobIDs)
-
-		if len(jobIDs) == 0 {
-			log.Printf("[AcquireTransferTasks] Still no job buffers available, returning 0 tasks")
-			c.JSON(http.StatusOK, tasks)
-			return
-		}
+	if len(jobIDs) == 0 {
+		log.Printf("[AcquireTransferTasks] Still no job buffers available, returning 0 tasks")
+		c.JSON(http.StatusOK, tasks)
+		return
 	}
 
 	if len(jobIDs) == 1 {

@@ -54,6 +54,7 @@ const (
 	DedupShards      = 256   // 去重 Hash 分成 256 片
 	TaskBucketSize   = 50000 // 任务 ZSet 每 5 万个 ID 分一个桶
 	TxBufferLogInterval = 10 * time.Second // Log every 10 seconds
+	LargeFileThresholdBytes = 1000 * 1024 * 1024 // 1GB
 )
 
 var (
@@ -2229,13 +2230,17 @@ func AcquireTransferTasks(c *gin.Context) {
 		maxPerJob = 1
 	}
 
-	// 随机打乱顺序，避免固定顺序导致的饥饿
 	rand.Shuffle(len(jobIDs), func(i, j int) {
 		jobIDs[i], jobIDs[j] = jobIDs[j], jobIDs[i]
 	})
 
-	// 轮询调度：每个 Job 轮流拿 1 个任务，直到 limit 满或所有 buffer 都空了
-	// 这样即使某些 Job 的 buffer 暂时为空，也不会影响其他 Job 的公平性
+	maxLargePerJob := maxPerJob / 4
+	if maxLargePerJob < 1 {
+		maxLargePerJob = 1
+	}
+
+	largeCounts := make(map[int64]int)
+
 	for i := 0; i < maxPerJob && len(tasks) < req.Limit; i++ {
 		for _, jid := range jobIDs {
 			if len(tasks) >= req.Limit {
@@ -2246,7 +2251,6 @@ func AcquireTransferTasks(c *gin.Context) {
 			ch, ok := txJobBuffers[jid]
 			bufferMutex.RUnlock()
 			if !ok {
-				// buffer 不存在，立即初始化并触发填充
 				ensureTxBuffer(jid)
 				triggerTxRefill(jid)
 				continue
@@ -2258,6 +2262,13 @@ func AcquireTransferTasks(c *gin.Context) {
 
 			select {
 			case t := <-ch:
+				if t.Size >= LargeFileThresholdBytes {
+					if largeCounts[jid] >= maxLargePerJob {
+						ch <- t
+						continue
+					}
+					largeCounts[jid]++
+				}
 				tasks = append(tasks, t)
 			default:
 			}

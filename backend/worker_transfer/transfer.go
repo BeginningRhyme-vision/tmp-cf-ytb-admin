@@ -138,6 +138,10 @@ var (
 	activeLargeFileCount     int32
 	activeSmallFileCount     int32
 	activeRetryLargeFileCount int32
+	
+	// Per-job large file tracking for fair distribution
+	jobLargeFileCounts  map[int64]int32
+	jobLargeFileMutex   sync.RWMutex
 
 	// Metrics
 	BytesTransferred = promauto.NewCounter(prometheus.CounterOpts{
@@ -225,8 +229,8 @@ const (
 	DefaultMaxLatencySamples              = 500
 
 	DefaultLargeFileThresholdMB           = 1000
-	DefaultMaxLargeFiles                  = 4
-	DefaultMaxRetryLargeFiles             = 4
+	DefaultMaxLargeFiles                  = 36
+	DefaultMaxRetryLargeFiles             = 36
 )
 
 func runTransfer() {
@@ -302,6 +306,7 @@ func runTransfer() {
 	atomic.StoreInt32(&effectivePartConcurrency, int32(partConcurrency))
 	recentLatencies = list.New()
 	lastDecreaseTime = time.Unix(0, 0)
+	jobLargeFileCounts = make(map[int64]int32)
 
 	httpClient = &http.Client{
 		Timeout: 20 * time.Second,
@@ -969,52 +974,110 @@ func processTask(t TransferTask) {
 	if t.Size >= largeFileThresholdBytes {
 		isRetry := t.RetryCount > 0
 		for {
+			jobLargeFileMutex.RLock()
+			jobCount := len(jobLargeFileCounts)
+			if jobCount == 0 {
+				jobCount = 1
+			}
+			jobCurrent := jobLargeFileCounts[t.JobID]
+			jobLargeFileMutex.RUnlock()
+			
+			maxPerJob := int32(maxLargeFiles) / int32(jobCount)
+			if maxPerJob < 1 {
+				maxPerJob = 1
+			}
+			
+			if jobCurrent >= maxPerJob {
+				log.Printf("[LargeFile] Task %d (Job %d) waiting: job has %d large files, max per job=%d",
+					t.ID, t.JobID, jobCurrent, maxPerJob)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			
 			if atomic.LoadInt32(&activeSmallFileCount) == 0 {
 				if isRetry {
 					current := atomic.LoadInt32(&activeRetryLargeFileCount)
 					if current < int32(maxRetryLargeFiles) {
 						if atomic.CompareAndSwapInt32(&activeRetryLargeFileCount, current, current+1) {
 							atomic.AddInt32(&activeLargeFileCount, 1)
-							log.Printf("[LargeFile] Task %d (%d bytes, retry=%d) acquired retry slot in unlimited mode (%d/%d)",
-								t.ID, t.Size, t.RetryCount, current+1, maxRetryLargeFiles)
+							jobLargeFileMutex.Lock()
+							jobLargeFileCounts[t.JobID]++
+							jobLargeFileMutex.Unlock()
+							log.Printf("[LargeFile] Task %d (Job %d, %d bytes, retry=%d) acquired retry slot in unlimited mode (%d/%d, job=%d/%d)",
+								t.ID, t.JobID, t.Size, t.RetryCount, current+1, maxRetryLargeFiles, jobCurrent+1, maxPerJob)
 							defer func() {
 								atomic.AddInt32(&activeLargeFileCount, -1)
 								atomic.AddInt32(&activeRetryLargeFileCount, -1)
+								jobLargeFileMutex.Lock()
+								jobLargeFileCounts[t.JobID]--
+								if jobLargeFileCounts[t.JobID] <= 0 {
+									delete(jobLargeFileCounts, t.JobID)
+								}
+								jobLargeFileMutex.Unlock()
 							}()
 							break
 						}
 					} else {
-						log.Printf("[LargeFile] Task %d (%d bytes, retry=%d) waiting for retry slot in unlimited mode (%d/%d)",
-							t.ID, t.Size, t.RetryCount, current, maxRetryLargeFiles)
+						log.Printf("[LargeFile] Task %d (Job %d, %d bytes, retry=%d) waiting for retry slot in unlimited mode (%d/%d)",
+							t.ID, t.JobID, t.Size, t.RetryCount, current, maxRetryLargeFiles)
 					}
 				} else {
 					atomic.AddInt32(&activeLargeFileCount, 1)
-					log.Printf("[LargeFile] Task %d (%d bytes) acquired slot in unlimited mode (first attempt)", t.ID, t.Size)
-					defer atomic.AddInt32(&activeLargeFileCount, -1)
+					jobLargeFileMutex.Lock()
+					jobLargeFileCounts[t.JobID]++
+					jobLargeFileMutex.Unlock()
+					log.Printf("[LargeFile] Task %d (Job %d, %d bytes) acquired slot in unlimited mode (first attempt, job=%d/%d)",
+						t.ID, t.JobID, t.Size, jobCurrent+1, maxPerJob)
+					defer func() {
+						atomic.AddInt32(&activeLargeFileCount, -1)
+						jobLargeFileMutex.Lock()
+						jobLargeFileCounts[t.JobID]--
+						if jobLargeFileCounts[t.JobID] <= 0 {
+							delete(jobLargeFileCounts, t.JobID)
+						}
+						jobLargeFileMutex.Unlock()
+					}()
 					break
 				}
 			} else {
 				current := atomic.LoadInt32(&activeLargeFileCount)
 				if current < int32(maxLargeFiles) {
 					if atomic.CompareAndSwapInt32(&activeLargeFileCount, current, current+1) {
+						jobLargeFileMutex.Lock()
+						jobLargeFileCounts[t.JobID]++
+						jobLargeFileMutex.Unlock()
 						if isRetry {
 							atomic.AddInt32(&activeRetryLargeFileCount, 1)
-							log.Printf("[LargeFile] Task %d (%d bytes, retry=%d) acquired large file slot (%d/%d), small files active",
-								t.ID, t.Size, t.RetryCount, current+1, maxLargeFiles)
+							log.Printf("[LargeFile] Task %d (Job %d, %d bytes, retry=%d) acquired large file slot (%d/%d, job=%d/%d), small files active",
+								t.ID, t.JobID, t.Size, t.RetryCount, current+1, maxLargeFiles, jobCurrent+1, maxPerJob)
 							defer func() {
 								atomic.AddInt32(&activeLargeFileCount, -1)
 								atomic.AddInt32(&activeRetryLargeFileCount, -1)
+								jobLargeFileMutex.Lock()
+								jobLargeFileCounts[t.JobID]--
+								if jobLargeFileCounts[t.JobID] <= 0 {
+									delete(jobLargeFileCounts, t.JobID)
+								}
+								jobLargeFileMutex.Unlock()
 							}()
 						} else {
-							log.Printf("[LargeFile] Task %d (%d bytes) acquired large file slot (%d/%d), small files active",
-								t.ID, t.Size, current+1, maxLargeFiles)
-							defer atomic.AddInt32(&activeLargeFileCount, -1)
+							log.Printf("[LargeFile] Task %d (Job %d, %d bytes) acquired large file slot (%d/%d, job=%d/%d), small files active",
+								t.ID, t.JobID, t.Size, current+1, maxLargeFiles, jobCurrent+1, maxPerJob)
+							defer func() {
+								atomic.AddInt32(&activeLargeFileCount, -1)
+								jobLargeFileMutex.Lock()
+								jobLargeFileCounts[t.JobID]--
+								if jobLargeFileCounts[t.JobID] <= 0 {
+									delete(jobLargeFileCounts, t.JobID)
+								}
+								jobLargeFileMutex.Unlock()
+							}()
 						}
 						break
 					}
 				} else {
-					log.Printf("[LargeFile] Task %d (%d bytes, retry=%d) waiting for large file slot (%d/%d), small files active",
-						t.ID, t.Size, t.RetryCount, current, maxLargeFiles)
+					log.Printf("[LargeFile] Task %d (Job %d, %d bytes, retry=%d) waiting for large file slot (%d/%d), small files active",
+						t.ID, t.JobID, t.Size, t.RetryCount, current, maxLargeFiles)
 				}
 			}
 			time.Sleep(5 * time.Second)

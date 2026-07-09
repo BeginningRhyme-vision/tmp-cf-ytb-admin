@@ -2143,6 +2143,8 @@ func AcquireTransferTasks(c *gin.Context) {
 		req.Limit = 10
 	}
 
+	log.Printf("[AcquireTransferTasks] Worker %s requesting %d transfer tasks", req.WorkerID, req.Limit)
+
 	tasks := []models.TransferTask{}
 
 	bufferMutex.RLock()
@@ -2152,7 +2154,10 @@ func AcquireTransferTasks(c *gin.Context) {
 	}
 	bufferMutex.RUnlock()
 
+	log.Printf("[AcquireTransferTasks] Available job buffers: %v", jobIDs)
+
 	if len(jobIDs) == 0 {
+		log.Printf("[AcquireTransferTasks] No job buffers available, returning 0 tasks")
 		c.JSON(http.StatusOK, tasks)
 		return
 	}
@@ -2215,6 +2220,15 @@ func AcquireTransferTasks(c *gin.Context) {
 			}
 		}
 	}
+
+	bufferMutex.RLock()
+	var bufferStatus []string
+	for jid, ch := range txJobBuffers {
+		bufferStatus = append(bufferStatus, fmt.Sprintf("job%d=%d", jid, len(ch)))
+	}
+	bufferMutex.RUnlock()
+
+	log.Printf("[AcquireTransferTasks] Returning %d tasks to worker %s, buffer status: %v", len(tasks), req.WorkerID, bufferStatus)
 	c.JSON(http.StatusOK, tasks)
 }
 func BatchUpdateTransfer(c *gin.Context) {

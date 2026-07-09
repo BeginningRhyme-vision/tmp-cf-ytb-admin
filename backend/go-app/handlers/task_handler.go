@@ -1891,6 +1891,8 @@ func fillTxJobBuffer(jobID int64) {
 
 // 【新逻辑】分片读取
 func fillShardedTxBuffer(ctx context.Context, jobID int64) {
+	log.Printf("[fillShardedTxBuffer] Starting for job %d", jobID)
+	
 	// 新 Offset Key (无 {})
 	offsetKey := fmt.Sprintf("tx:job:%d:offset", jobID)
 	offsetStr, _ := database.RDB.Get(ctx, offsetKey).Result()
@@ -1898,6 +1900,7 @@ func fillShardedTxBuffer(ctx context.Context, jobID int64) {
 	if offsetStr != "" {
 		fmt.Sscanf(offsetStr, "%d", &lastTaskID)
 	}
+	log.Printf("[fillShardedTxBuffer] Job %d: lastTaskID=%d", jobID, lastTaskID)
 
 	// 获取当前最大任务 ID
 	maxIDKey := fmt.Sprintf("tx:job:%d:max_id", jobID)
@@ -1906,6 +1909,7 @@ func fillShardedTxBuffer(ctx context.Context, jobID int64) {
 	if maxIDStr != "" {
 		fmt.Sscanf(maxIDStr, "%d", &currentMaxID)
 	}
+	log.Printf("[fillShardedTxBuffer] Job %d: currentMaxID=%d", jobID, currentMaxID)
 
 	// 如果 offset 超过了当前最大任务 ID，说明任务还在持续写入中
 	// 我们需要等待任务写入完成，或者重置 offset 到当前最大 ID - 一个批次
@@ -1936,7 +1940,10 @@ func fillShardedTxBuffer(ctx context.Context, jobID int64) {
 		Offset: 0,
 	}).Result()
 
+	log.Printf("[fillShardedTxBuffer] Job %d: bucketKey=%s, startID=%d, ids_count=%d", jobID, bucketKey, startID, len(ids))
+
 	if err != nil {
+		log.Printf("[fillShardedTxBuffer] Job %d: ZRangeByScore error: %v", jobID, err)
 		return
 	}
 
@@ -1945,15 +1952,18 @@ func fillShardedTxBuffer(ctx context.Context, jobID int64) {
 	if len(ids) == 0 {
 		nextStartID := (startID/TaskBucketSize + 1) * TaskBucketSize
 		nextBucketKey := getTaskBucketKey(jobID, nextStartID)
+		log.Printf("[fillShardedTxBuffer] Job %d: current bucket empty, trying next bucket %s starting at %d", jobID, nextBucketKey, nextStartID)
 		ids, _ = database.RDB.ZRangeByScore(ctx, nextBucketKey, &redis.ZRangeBy{
 			Min:    fmt.Sprintf("%d", nextStartID),
 			Max:    "+inf",
 			Count:  int64(TxFetchBatchSize),
 			Offset: 0,
 		}).Result()
+		log.Printf("[fillShardedTxBuffer] Job %d: next bucket returned %d ids", jobID, len(ids))
 	}
 
 	if len(ids) == 0 {
+		log.Printf("[fillShardedTxBuffer] Job %d: no ids found, returning", jobID)
 		return
 	}
 

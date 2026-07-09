@@ -1756,8 +1756,15 @@ func checkAndRefillTxBuffers() {
 		bufferMutex.RUnlock()
 
 		if !exists {
+			log.Printf("[checkAndRefillTxBuffers] Job %d: buffer does not exist, skipping", jid)
 			continue
 		}
+
+		bufferLen := len(ch)
+		key := fmt.Sprintf("tx:%d", jid)
+		_, filling := fillingMap.Load(key)
+
+		log.Printf("[checkAndRefillTxBuffers] Job %d: bufferLen=%d, pending=%d, filling=%v", jid, bufferLen, job.PendingCount, filling)
 
 		// 检查卡死状态: Pending > 0, Buffer Empty, Not Filling
 		if job.PendingCount > 0 && len(ch) == 0 {
@@ -1813,7 +1820,10 @@ func checkAndRefillTxBuffers() {
 		}
 
 		if len(ch) < BufferLowWater {
+			log.Printf("[checkAndRefillTxBuffers] Job %d: bufferLen=%d < BufferLowWater=%d, triggering refill", jid, len(ch), BufferLowWater)
 			triggerTxRefill(jid)
+		} else {
+			log.Printf("[checkAndRefillTxBuffers] Job %d: bufferLen=%d >= BufferLowWater=%d, skipping refill", jid, len(ch), BufferLowWater)
 		}
 	}
 }

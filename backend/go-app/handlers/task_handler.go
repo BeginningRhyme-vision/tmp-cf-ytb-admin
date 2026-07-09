@@ -2853,8 +2853,6 @@ func StartTransferJobMonitor() {
 }
 
 func updateCompletedTransferJobs() {
-	// 通过子查询检查是否有 PENDING 或 RUNNING 状态的任务
-	// 不依赖 pending_count/running_count 字段，因为它们可能因 stats 批量更新延迟而不准确
 	query := `
 		UPDATE transfer_jobs
 		SET
@@ -2871,6 +2869,9 @@ func updateCompletedTransferJobs() {
 			AND total_count > 0
 			AND periodic_interval = 0
 			AND last_scan_time IS NOT NULL
+			AND EXISTS (
+				SELECT 1 FROM transfer_tasks WHERE job_id = transfer_jobs.job_id
+			)
 			AND job_id NOT IN (
 				SELECT DISTINCT job_id FROM transfer_tasks
 				WHERE status IN ('PENDING', 'RUNNING')

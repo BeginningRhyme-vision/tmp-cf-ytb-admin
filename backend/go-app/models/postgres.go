@@ -51,6 +51,7 @@ type TransferJob struct {
 	IsIncremental    bool       `gorm:"default:false" json:"is_incremental"`
 	PeriodicInterval int        `gorm:"default:0" json:"periodic_interval"` // In seconds. 0 = not periodic
 	LastScanTime     *time.Time `json:"last_scan_time"`
+	LastScannedKey   *string    `gorm:"size:1024" json:"last_scanned_key"` // Last scanned key for StartAfter optimization
 	Status           JobStatus  `gorm:"type:varchar(50);default:'PENDING'" json:"status"`
 	StartTime        *time.Time `json:"start_time"`
 	EndTime          *time.Time `json:"end_time"`
@@ -104,6 +105,7 @@ type FfmpegJob struct {
 	IsIncremental    bool       `gorm:"default:false" json:"is_incremental"`
 	PeriodicInterval int        `gorm:"default:0" json:"periodic_interval"` // In seconds
 	LastScanTime     *time.Time `json:"last_scan_time"`
+	LastScannedKey   *string    `gorm:"size:1024" json:"last_scanned_key"` // Last scanned key for StartAfter optimization
 	Status           JobStatus  `gorm:"type:varchar(50);default:'PENDING'" json:"status"`
 	TotalCount       int        `gorm:"default:0" json:"total_count"`
 	PendingCount     int        `gorm:"default:0" json:"pending_count"`

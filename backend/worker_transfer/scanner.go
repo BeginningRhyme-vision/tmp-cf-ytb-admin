@@ -37,12 +37,14 @@ type TransferJob struct {
 	PeriodicInterval int              `json:"periodic_interval"`
 	IsIncremental    bool             `json:"is_incremental"`
 	LastScanTime     *time.Time       `json:"last_scan_time"`
+	LastScannedKey   *string          `json:"last_scanned_key"`
 }
 
 type UpdateStatusRequest struct {
-	Status        string     `json:"status"`
-	LastScanTime  *time.Time `json:"last_scan_time,omitempty"`
-	ResultMessage string     `json:"result_message,omitempty"`
+	Status         string     `json:"status"`
+	LastScanTime   *time.Time `json:"last_scan_time,omitempty"`
+	LastScannedKey *string    `json:"last_scanned_key,omitempty"`
+	ResultMessage  string     `json:"result_message,omitempty"`
 }
 
 var (
@@ -129,8 +131,8 @@ func getPendingJobs() ([]TransferJob, error) {
 	return jobs, nil
 }
 
-func updateJobStatus(jobID uint, status string, lastScanTime *time.Time, msg string) error {
-	req := UpdateStatusRequest{Status: status, LastScanTime: lastScanTime, ResultMessage: msg}
+func updateJobStatus(jobID uint, status string, lastScanTime *time.Time, lastScannedKey *string, msg string) error {
+	req := UpdateStatusRequest{Status: status, LastScanTime: lastScanTime, LastScannedKey: lastScannedKey, ResultMessage: msg}
 	data, _ := json.Marshal(req)
 
 	reqObj, _ := http.NewRequest("PATCH", fmt.Sprintf("%s/jobs/%d/status", apiBaseURL, jobID), bytes.NewBuffer(data))
@@ -158,7 +160,7 @@ func processJob(job TransferJob) {
 	jobJSON, _ := json.Marshal(job)
 	log.Printf("Processing Job: %s", string(jobJSON))
 
-	if err := updateJobStatus(job.JobID, "RUNNING", nil, ""); err != nil {
+	if err := updateJobStatus(job.JobID, "RUNNING", nil, nil, ""); err != nil {
 		log.Printf("Failed to set RUNNING for job %d: %v", job.JobID, err)
 		return
 	}
@@ -166,7 +168,7 @@ func processJob(job TransferJob) {
 	s3Client, err := initSourceS3()
 	if err != nil {
 		log.Printf("Failed to init S3 for job %d: %v", job.JobID, err)
-		updateJobStatus(job.JobID, "FAILED", nil, fmt.Sprintf("Init S3 failed: %v", err))
+		updateJobStatus(job.JobID, "FAILED", nil, nil, fmt.Sprintf("Init S3 failed: %v", err))
 		return
 	}
 
@@ -179,10 +181,15 @@ func processJob(job TransferJob) {
 		Prefix: aws.String(prefix),
 	}
 
-	isIncremental := job.PeriodicInterval > 0 && job.LastScanTime != nil
+	isIncremental := job.IsIncremental && job.PeriodicInterval > 0 && job.LastScanTime != nil
 	if isIncremental {
 		log.Printf("Incremental scan: job %d will filter objects modified since %v",
 			job.JobID, *job.LastScanTime)
+		
+		if job.LastScannedKey != nil && *job.LastScannedKey != "" {
+			input.StartAfter = job.LastScannedKey
+			log.Printf("StartAfter optimization: job %d will start scanning from key '%s'", job.JobID, *job.LastScannedKey)
+		}
 	}
 
 	paginator := s3.NewListObjectsV2Paginator(s3Client, input)
@@ -191,6 +198,7 @@ func processJob(job TransferJob) {
 	skipped := 0
 	pages := 0
 	lastUpdate := time.Now()
+	var lastKey *string
 
 	taskChan := make(chan TransferTaskInput, 1500)
 	var wg sync.WaitGroup
@@ -261,7 +269,7 @@ func processJob(job TransferJob) {
 
 		if err != nil {
 			log.Printf("ListObjectsV2 failed for job %d on page %d after %d retries: %v", job.JobID, pages, maxRetries, err)
-			updateJobStatus(job.JobID, "FAILED", nil, fmt.Sprintf("List failed on page %d after %d retries: %v", pages, maxRetries, err))
+			updateJobStatus(job.JobID, "FAILED", nil, nil, fmt.Sprintf("List failed on page %d after %d retries: %v", pages, maxRetries, err))
 			close(taskChan)
 			return
 		}
@@ -272,6 +280,9 @@ func processJob(job TransferJob) {
 			if strings.HasSuffix(key, "/") {
 				continue
 			}
+
+			// Update last key (even if we skip it, since it's part of the scan)
+			lastKey = &key
 
 			if isIncremental && obj.LastModified.Before(*job.LastScanTime) {
 				skipped++
@@ -325,7 +336,7 @@ func processJob(job TransferJob) {
 			}
 
 			msg := fmt.Sprintf("Scanning... Pages: %d, Tasks: %d, Skipped: %d", pages, count, skipped)
-			updateJobStatus(job.JobID, "RUNNING", nil, msg)
+			updateJobStatus(job.JobID, "RUNNING", nil, nil, msg)
 			lastUpdate = time.Now()
 		}
 
@@ -339,12 +350,13 @@ func processJob(job TransferJob) {
 
 	log.Printf("Job %d scanned. Total pages: %d. New tasks: %d, Skipped (old): %d", job.JobID, pages, count, skipped)
 	resultMsg := fmt.Sprintf("Scanned %d pages. Tasks: %d, Skipped: %d", pages, count, skipped)
-
-	if job.PeriodicInterval > 0 {
-		updateJobStatus(job.JobID, "RUNNING", &startTime, resultMsg)
+	
+	endTime := time.Now()
+	if job.IsIncremental && job.PeriodicInterval > 0 {
+		updateJobStatus(job.JobID, "RUNNING", &endTime, lastKey, resultMsg)
 		log.Printf("Job %d is periodic. Next scan in %d seconds.", job.JobID, job.PeriodicInterval)
 	} else {
-		updateJobStatus(job.JobID, "RUNNING", &startTime, resultMsg)
+		updateJobStatus(job.JobID, "RUNNING", &startTime, lastKey, resultMsg)
 	}
 }
 

@@ -621,16 +621,17 @@ func RetryFailedTransferTasks(c *gin.Context) {
 }
 
 type UpdateJobStatusRequest struct {
-	Status        models.JobStatus `json:"status"`
-	LastScanTime  *time.Time       `json:"last_scan_time"`
-	ResultMessage string           `json:"result_message"`
-	IncSuccess    int              `json:"inc_success"`
-	IncFailed     int              `json:"inc_failed"`
-	IncSuccessBytes int64          `json:"inc_success_bytes"`
-	StartTime     *time.Time       `json:"start_time"`
-	EndTime       *time.Time       `json:"end_time"`
-	TotalCount    *int             `json:"total_count"`
-	IncExecution  bool             `json:"inc_execution"`
+	Status         models.JobStatus `json:"status"`
+	LastScanTime   *time.Time       `json:"last_scan_time"`
+	LastScannedKey *string          `json:"last_scanned_key"`
+	ResultMessage  string           `json:"result_message"`
+	IncSuccess     int              `json:"inc_success"`
+	IncFailed      int              `json:"inc_failed"`
+	IncSuccessBytes int64           `json:"inc_success_bytes"`
+	StartTime      *time.Time       `json:"start_time"`
+	EndTime        *time.Time       `json:"end_time"`
+	TotalCount     *int             `json:"total_count"`
+	IncExecution   bool             `json:"inc_execution"`
 }
 
 func UpdateTransferJobStatus(c *gin.Context) {
@@ -653,6 +654,9 @@ func UpdateTransferJobStatus(c *gin.Context) {
 	}
 	if req.LastScanTime != nil {
 		updates["last_scan_time"] = req.LastScanTime
+	}
+	if req.LastScannedKey != nil {
+		updates["last_scanned_key"] = req.LastScannedKey
 	}
 	if req.ResultMessage != "" {
 		updates["result_message"] = req.ResultMessage
@@ -1794,6 +1798,9 @@ func UpdateFfmpegJobStatus(c *gin.Context) {
 	}
 	if req.LastScanTime != nil {
 		updates["last_scan_time"] = req.LastScanTime
+	}
+	if req.LastScannedKey != nil {
+		updates["last_scanned_key"] = req.LastScannedKey
 	}
 	if req.TotalCount != nil {
 		updates["total_count"] = *req.TotalCount

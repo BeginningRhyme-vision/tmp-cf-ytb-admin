@@ -268,7 +268,7 @@ func getPendingJobs() ([]common.FfmpegJob, error) {
 			} else {
 				totalCount := 0
 				time := time.Now()
-				updateJobStatus(job.ID, "PENDING", &time, "Endpoint check failed: zone/provider/private-endpoint policy mismatch", &totalCount)
+				updateJobStatus(job.ID, "PENDING", &time, nil, "Endpoint check failed: zone/provider/private-endpoint policy mismatch", &totalCount)
 				log.Println("Job endpoint check failed, skip")
 			}
 		}
@@ -311,11 +311,12 @@ func isAllowedEndpoint(endpoint string) bool {
 	return true
 }
 
-func updateJobStatus(jobID int64, status string, lastScanTime *time.Time, msg string, totalCount *int) error {
+func updateJobStatus(jobID int64, status string, lastScanTime *time.Time, lastScannedKey *string, msg string, totalCount *int) error {
 	req := common.UpdateJobStatusRequest{
-		Status:        status,
-		LastScanTime:  lastScanTime,
-		ResultMessage: msg,
+		Status:         status,
+		LastScanTime:   lastScanTime,
+		LastScannedKey: lastScannedKey,
+		ResultMessage:  msg,
 	}
 	if totalCount != nil {
 		req.TotalCount = totalCount
@@ -349,7 +350,7 @@ func processJob(job common.FfmpegJob) {
 	startTime := time.Now()
 	log.Printf("Processing Job %d: %s (Incremental: %v)", job.ID, job.S3Prefix, job.IsIncremental)
 
-	if err := updateJobStatus(job.ID, "RUNNING", nil, "", nil); err != nil {
+	if err := updateJobStatus(job.ID, "RUNNING", nil, nil, "", nil); err != nil {
 		if strings.Contains(err.Error(), "status 404") {
 			cleanUpDedup(job.ID)
 		}
@@ -360,21 +361,31 @@ func processJob(job common.FfmpegJob) {
 	s3Client, err := createS3Client(job.Metadata.Endpoint, job.Metadata.AK, job.Metadata.SKEncrypted)
 	if err != nil {
 		log.Printf("Failed to init S3 for job %d: %v", job.ID, err)
-		updateJobStatus(job.ID, "FAILED", nil, fmt.Sprintf("Init S3 failed: %v", err), nil)
+		updateJobStatus(job.ID, "FAILED", nil, nil, fmt.Sprintf("Init S3 failed: %v", err), nil)
 		return
 	}
 
 	bucket := getBucketFromEndpoint(job.Metadata.Endpoint)
 	prefix := job.S3Prefix
 
-	paginator := s3.NewListObjectsV2Paginator(s3Client, &s3.ListObjectsV2Input{
+	// Prepare ListObjects input with optional StartAfter
+	listInput := &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucket),
 		Prefix: aws.String(prefix),
-	})
+	}
+
+	// Apply StartAfter optimization for incremental jobs
+	if job.IsIncremental && job.LastScannedKey != nil && *job.LastScannedKey != "" {
+		listInput.StartAfter = job.LastScannedKey
+		log.Printf("StartAfter optimization: job %d will start scanning from key '%s'", job.ID, *job.LastScannedKey)
+	}
+
+	paginator := s3.NewListObjectsV2Paginator(s3Client, listInput)
 
 	pairs := make(map[string]*FilePair)
 	pages := 0
 	count := 0
+	var lastKey *string
 
 	for paginator.HasMorePages() {
 		pages++
@@ -382,7 +393,7 @@ func processJob(job common.FfmpegJob) {
 		page, err := paginator.NextPage(context.TODO())
 		if err != nil {
 			log.Printf("List failed for job %d: %v", job.ID, err)
-			updateJobStatus(job.ID, "FAILED", nil, err.Error(), nil)
+			updateJobStatus(job.ID, "FAILED", nil, nil, err.Error(), nil)
 			return
 		}
 
@@ -393,6 +404,9 @@ func processJob(job common.FfmpegJob) {
 			if obj.Size != nil {
 				size = *obj.Size
 			}
+
+			// Update last key (even if we skip it, since it's part of the scan)
+			lastKey = &key
 
 			if strings.Contains(name, "_video.") {
 				id := strings.Split(name, "_video.")[0]
@@ -540,7 +554,7 @@ func processJob(job common.FfmpegJob) {
 				log.Printf("Failed to push batch for job %d: %v", job.ID, errPush)
 			}
 			count += len(batch)
-			if err := updateJobStatus(job.ID, "RUNNING", nil, "", &count); err != nil {
+			if err := updateJobStatus(job.ID, "RUNNING", nil, nil, "", &count); err != nil {
 				if strings.Contains(err.Error(), "status 404") {
 					cleanUpDedup(job.ID)
 					return
@@ -552,13 +566,14 @@ func processJob(job common.FfmpegJob) {
 
 	resultMsg := fmt.Sprintf("Scanned %d pages. Tasks Discovered: %d", pages, count)
 	log.Printf("Job %d scan completed. %s", job.ID, resultMsg)
-
+	
+	endTime := time.Now()
 	var errFinal error
 	if job.IsIncremental {
-		// Keep running, update scan time
-		errFinal = updateJobStatus(job.ID, "RUNNING", &startTime, resultMsg, nil)
+		// Keep running, update scan time and last scanned key
+		errFinal = updateJobStatus(job.ID, "RUNNING", &endTime, lastKey, resultMsg, nil)
 	} else {
-		errFinal = updateJobStatus(job.ID, "COMPLETED", &startTime, resultMsg, nil)
+		errFinal = updateJobStatus(job.ID, "COMPLETED", &startTime, lastKey, resultMsg, nil)
 	}
 
 	if errFinal != nil {

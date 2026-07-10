@@ -9,6 +9,7 @@ type FfmpegJob struct {
 	IsIncremental    bool      `json:"is_incremental"`
 	PeriodicInterval int       `json:"periodic_interval"`
 	LastScanTime     *time.Time `json:"last_scan_time"`
+	LastScannedKey   *string   `json:"last_scanned_key"`
 	Status           string    `json:"status"`
 	Metadata         TransferMetadata `json:"metadata"`
 }
@@ -39,11 +40,12 @@ type FfmpegTask struct {
 }
 
 type UpdateJobStatusRequest struct {
-	Status        string     `json:"status,omitempty"`
-	LastScanTime  *time.Time `json:"last_scan_time,omitempty"`
-	ResultMessage string     `json:"result_message,omitempty"`
-	TotalCount    *int       `json:"total_count,omitempty"`
-	IncSuccess    int        `json:"inc_success,omitempty"`
-	IncFailed     int        `json:"inc_failed,omitempty"`
+	Status         string     `json:"status,omitempty"`
+	LastScanTime   *time.Time `json:"last_scan_time,omitempty"`
+	LastScannedKey *string    `json:"last_scanned_key,omitempty"`
+	ResultMessage  string     `json:"result_message,omitempty"`
+	TotalCount     *int       `json:"total_count,omitempty"`
+	IncSuccess     int        `json:"inc_success,omitempty"`
+	IncFailed      int        `json:"inc_failed,omitempty"`
 	IncSuccessBytes int64    `json:"inc_success_bytes,omitempty"`
 }

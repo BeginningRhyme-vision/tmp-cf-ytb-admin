@@ -165,6 +165,13 @@ func processJob(job TransferJob) {
 		return
 	}
 
+	// 如果是非增量任务并且已经扫描过（有 last_scan_time），就不再重新扫描
+	// 避免重复添加已经完成的任务
+	if !job.IsIncremental && job.LastScanTime != nil {
+		log.Printf("Job %d is non-incremental and already scanned. Skipping re-scan.", job.JobID)
+		return
+	}
+
 	s3Client, err := initSourceS3()
 	if err != nil {
 		log.Printf("Failed to init S3 for job %d: %v", job.JobID, err)

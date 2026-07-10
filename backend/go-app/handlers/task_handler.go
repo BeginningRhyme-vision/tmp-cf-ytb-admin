@@ -3009,7 +3009,13 @@ func updateCompletedTransferJobs() {
 			)
 			AND job_id NOT IN (
 				SELECT DISTINCT job_id FROM transfer_tasks
-				WHERE status IN ('PENDING', 'RUNNING', 'FAILED')
+				WHERE status IN ('PENDING', 'RUNNING')
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM transfer_tasks
+				WHERE job_id = transfer_jobs.job_id
+				AND status = 'FAILED'
+				AND retry_count < 3
 			)
 	`
 	result := database.DB.Exec(query, models.StatusCompleted, models.StatusRunning)

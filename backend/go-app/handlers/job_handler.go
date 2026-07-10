@@ -203,7 +203,13 @@ func StartTransferJob(c *gin.Context) {
 		"end_time":         nil,
 		"duration_seconds": 0,
 		"result_message":   "",
-		"last_scan_time":   nil,
+	}
+
+	// 只有当任务是增量任务时，才重置 last_scan_time 和 last_scanned_key
+	// 对于非增量任务，避免重新扫描已经成功完成的文件
+	if job.IsIncremental {
+		updates["last_scan_time"] = nil
+		updates["last_scanned_key"] = nil
 	}
 
 	if err := database.DB.Model(&job).Updates(updates).Error; err != nil {
@@ -211,8 +217,16 @@ func StartTransferJob(c *gin.Context) {
 		return
 	}
 
-	ensureTxBuffer(int64(job.JobID))
-	triggerTxRefill(int64(job.JobID))
+	// 如果是非增量任务并且已经全部成功完成（success_count = total_count）
+	// 只尝试重试可能的失败任务，而不是重新扫描
+	if !job.IsIncremental && job.TotalCount > 0 && job.SuccessCount >= job.TotalCount {
+		// 只触发重试逻辑，不重置扫描时间，避免重新扫描
+		go RetryTransferTasksLogic(int(job.JobID), job.Status)
+	} else {
+		// 其他情况正常处理
+		ensureTxBuffer(int64(job.JobID))
+		triggerTxRefill(int64(job.JobID))
+	}
 
 	c.JSON(http.StatusOK, job)
 }

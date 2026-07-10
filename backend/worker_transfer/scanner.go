@@ -41,10 +41,12 @@ type TransferJob struct {
 }
 
 type UpdateStatusRequest struct {
-	Status         string     `json:"status"`
-	LastScanTime   *time.Time `json:"last_scan_time,omitempty"`
-	LastScannedKey *string    `json:"last_scanned_key,omitempty"`
-	ResultMessage  string     `json:"result_message,omitempty"`
+	Status              string     `json:"status"`
+	LastScanTime        *time.Time `json:"last_scan_time,omitempty"`
+	LastScannedKey      *string    `json:"last_scanned_key,omitempty"`
+	ResultMessage       string     `json:"result_message,omitempty"`
+	IncExecution        bool       `json:"inc_execution,omitempty"`
+	ScanDiscoveredCount *int       `json:"scan_discovered_count,omitempty"`
 }
 
 var (
@@ -131,8 +133,15 @@ func getPendingJobs() ([]TransferJob, error) {
 	return jobs, nil
 }
 
-func updateJobStatus(jobID uint, status string, lastScanTime *time.Time, lastScannedKey *string, msg string) error {
-	req := UpdateStatusRequest{Status: status, LastScanTime: lastScanTime, LastScannedKey: lastScannedKey, ResultMessage: msg}
+func updateJobStatus(jobID uint, status string, lastScanTime *time.Time, lastScannedKey *string, msg string, incExecution bool, scanDiscoveredCount *int) error {
+	req := UpdateStatusRequest{
+		Status:              status,
+		LastScanTime:        lastScanTime,
+		LastScannedKey:      lastScannedKey,
+		ResultMessage:       msg,
+		IncExecution:        incExecution,
+		ScanDiscoveredCount: scanDiscoveredCount,
+	}
 	data, _ := json.Marshal(req)
 
 	reqObj, _ := http.NewRequest("PATCH", fmt.Sprintf("%s/jobs/%d/status", apiBaseURL, jobID), bytes.NewBuffer(data))
@@ -156,11 +165,10 @@ type TransferTaskInput struct {
 }
 
 func processJob(job TransferJob) {
-	startTime := time.Now()
 	jobJSON, _ := json.Marshal(job)
 	log.Printf("Processing Job: %s", string(jobJSON))
 
-	if err := updateJobStatus(job.JobID, "RUNNING", nil, nil, ""); err != nil {
+	if err := updateJobStatus(job.JobID, "RUNNING", nil, nil, "", false, nil); err != nil {
 		log.Printf("Failed to set RUNNING for job %d: %v", job.JobID, err)
 		return
 	}
@@ -175,7 +183,7 @@ func processJob(job TransferJob) {
 	s3Client, err := initSourceS3()
 	if err != nil {
 		log.Printf("Failed to init S3 for job %d: %v", job.JobID, err)
-		updateJobStatus(job.JobID, "FAILED", nil, nil, fmt.Sprintf("Init S3 failed: %v", err))
+		updateJobStatus(job.JobID, "FAILED", nil, nil, fmt.Sprintf("Init S3 failed: %v", err), false, nil)
 		return
 	}
 
@@ -192,7 +200,7 @@ func processJob(job TransferJob) {
 	if isIncremental {
 		log.Printf("Incremental scan: job %d will filter objects modified since %v",
 			job.JobID, *job.LastScanTime)
-		
+
 		if job.LastScannedKey != nil && *job.LastScannedKey != "" {
 			input.StartAfter = job.LastScannedKey
 			log.Printf("StartAfter optimization: job %d will start scanning from key '%s'", job.JobID, *job.LastScannedKey)
@@ -276,7 +284,7 @@ func processJob(job TransferJob) {
 
 		if err != nil {
 			log.Printf("ListObjectsV2 failed for job %d on page %d after %d retries: %v", job.JobID, pages, maxRetries, err)
-			updateJobStatus(job.JobID, "FAILED", nil, nil, fmt.Sprintf("List failed on page %d after %d retries: %v", pages, maxRetries, err))
+			updateJobStatus(job.JobID, "FAILED", nil, nil, fmt.Sprintf("List failed on page %d after %d retries: %v", pages, maxRetries, err), false, nil)
 			close(taskChan)
 			return
 		}
@@ -343,7 +351,7 @@ func processJob(job TransferJob) {
 			}
 
 			msg := fmt.Sprintf("Scanning... Pages: %d, Tasks: %d, Skipped: %d", pages, count, skipped)
-			updateJobStatus(job.JobID, "RUNNING", nil, nil, msg)
+			updateJobStatus(job.JobID, "RUNNING", nil, nil, msg, false, nil)
 			lastUpdate = time.Now()
 		}
 
@@ -357,13 +365,13 @@ func processJob(job TransferJob) {
 
 	log.Printf("Job %d scanned. Total pages: %d. New tasks: %d, Skipped (old): %d", job.JobID, pages, count, skipped)
 	resultMsg := fmt.Sprintf("Scanned %d pages. Tasks: %d, Skipped: %d", pages, count, skipped)
-	
+
 	endTime := time.Now()
 	if job.IsIncremental && job.PeriodicInterval > 0 {
-		updateJobStatus(job.JobID, "RUNNING", &endTime, lastKey, resultMsg)
+		updateJobStatus(job.JobID, "RUNNING", &endTime, lastKey, resultMsg, true, &count)
 		log.Printf("Job %d is periodic. Next scan in %d seconds.", job.JobID, job.PeriodicInterval)
 	} else {
-		updateJobStatus(job.JobID, "RUNNING", &startTime, lastKey, resultMsg)
+		updateJobStatus(job.JobID, "RUNNING", &endTime, lastKey, resultMsg, true, &count)
 	}
 }
 

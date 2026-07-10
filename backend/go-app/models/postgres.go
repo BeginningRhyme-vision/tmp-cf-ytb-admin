@@ -7,13 +7,14 @@ import (
 type JobStatus string
 
 const (
-	StatusPending   JobStatus = "PENDING"
-	StatusRunning   JobStatus = "RUNNING"
-	StatusPaused    JobStatus = "PAUSED"
-	StatusStopped   JobStatus = "STOPPED"
-	StatusCompleted JobStatus = "COMPLETED"
-	StatusFailed    JobStatus = "FAILED"
-	StatusScanning  JobStatus = "SCANNING"
+	StatusPending         JobStatus = "PENDING"
+	StatusRunning         JobStatus = "RUNNING"
+	StatusPaused          JobStatus = "PAUSED"
+	StatusStopped         JobStatus = "STOPPED"
+	StatusCompleted       JobStatus = "COMPLETED"
+	StatusPhasedCompleted JobStatus = "PHASEDCOMPLETED"
+	StatusFailed          JobStatus = "FAILED"
+	StatusScanning        JobStatus = "SCANNING"
 )
 
 type User struct {
@@ -41,33 +42,34 @@ func (TransferMetadata) TableName() string {
 }
 
 type TransferJob struct {
-	JobID            uint       `gorm:"primaryKey;column:job_id" json:"job_id"`
-	MetadataID       uint       `gorm:"index" json:"metadata_id"`
-	SrcDir           string     `gorm:"size:1024;not null" json:"src_dir"`
-	DstDir           string     `gorm:"size:1024;not null" json:"dst_dir"`
-	Include          string     `gorm:"size:1024" json:"include"`
-	Exclude          string     `gorm:"size:1024" json:"exclude"`
-	DeleteSource     bool       `gorm:"default:false" json:"delete_source"`
-	IsIncremental    bool       `gorm:"default:false" json:"is_incremental"`
-	PeriodicInterval int        `gorm:"default:0" json:"periodic_interval"` // In seconds. 0 = not periodic
-	LastScanTime     *time.Time `json:"last_scan_time"`
-	LastScannedKey   *string    `gorm:"size:1024" json:"last_scanned_key"` // Last scanned key for StartAfter optimization
-	Status           JobStatus  `gorm:"type:varchar(50);default:'PENDING'" json:"status"`
-	StartTime        *time.Time `json:"start_time"`
-	EndTime          *time.Time `json:"end_time"`
-	DurationSeconds  int        `json:"duration_seconds"`
-	ExecutionCount   int        `json:"execution_count"`
-	TotalCount       int        `gorm:"default:0" json:"total_count"`
-	PendingCount     int        `gorm:"default:0" json:"pending_count"`
-	RunningCount     int        `gorm:"default:0" json:"running_count"`
-	SuccessCount     int        `gorm:"default:0" json:"success_count"`
-	FailedCount      int        `gorm:"default:0" json:"failed_count"`
-	TotalSizeBytes   int64      `gorm:"default:0" json:"total_size_bytes"`
-	SuccessSizeBytes int64      `gorm:"default:0" json:"success_size_bytes"`
-	ResultMessage    string     `gorm:"type:text" json:"result_message"`
-	RedisCleaned     bool       `gorm:"default:false" json:"redis_cleaned"`
-	CreatedAt        time.Time  `gorm:"autoCreateTime" json:"created_at"`
-	UpdatedAt        time.Time  `gorm:"autoUpdateTime" json:"updated_at"`
+	JobID                uint       `gorm:"primaryKey;column:job_id" json:"job_id"`
+	MetadataID           uint       `gorm:"index" json:"metadata_id"`
+	SrcDir               string     `gorm:"size:1024;not null" json:"src_dir"`
+	DstDir               string     `gorm:"size:1024;not null" json:"dst_dir"`
+	Include              string     `gorm:"size:1024" json:"include"`
+	Exclude              string     `gorm:"size:1024" json:"exclude"`
+	DeleteSource         bool       `gorm:"default:false" json:"delete_source"`
+	IsIncremental        bool       `gorm:"default:false" json:"is_incremental"`
+	PeriodicInterval     int        `gorm:"default:0" json:"periodic_interval"` // In seconds. 0 = not periodic
+	LastScanTime         *time.Time `json:"last_scan_time"`
+	LastScannedKey       *string    `gorm:"size:1024" json:"last_scanned_key"` // Last scanned key for StartAfter optimization
+	Status               JobStatus  `gorm:"type:varchar(50);default:'PENDING'" json:"status"`
+	StartTime            *time.Time `json:"start_time"`
+	EndTime              *time.Time `json:"end_time"`
+	DurationSeconds      int        `json:"duration_seconds"`
+	ExecutionCount       int        `json:"execution_count"`
+	ConsecutiveIdleScans int        `gorm:"default:0" json:"consecutive_idle_scans"`
+	TotalCount           int        `gorm:"default:0" json:"total_count"`
+	PendingCount         int        `gorm:"default:0" json:"pending_count"`
+	RunningCount         int        `gorm:"default:0" json:"running_count"`
+	SuccessCount         int        `gorm:"default:0" json:"success_count"`
+	FailedCount          int        `gorm:"default:0" json:"failed_count"`
+	TotalSizeBytes       int64      `gorm:"default:0" json:"total_size_bytes"`
+	SuccessSizeBytes     int64      `gorm:"default:0" json:"success_size_bytes"`
+	ResultMessage        string     `gorm:"type:text" json:"result_message"`
+	RedisCleaned         bool       `gorm:"default:false" json:"redis_cleaned"`
+	CreatedAt            time.Time  `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt            time.Time  `gorm:"autoUpdateTime" json:"updated_at"`
 
 	Metadata TransferMetadata `gorm:"foreignKey:MetadataID" json:"metadata"`
 }
@@ -143,11 +145,11 @@ func (PipelineJob) TableName() string {
 // WorkerCookieConfig 记录机器名和cookie的绑定关系
 type WorkerCookieConfig struct {
 	ID                uint      `gorm:"primaryKey" json:"id"`
-	MachineName       string    `gorm:"size:255;not null" json:"machine_name"` // 机器名（允许多条记录，用于轮询多个 cookie）
-	CookieContent     string    `gorm:"type:text;not null" json:"cookie_content"`          // 完整的cookie内容（text格式）
-	Enabled           bool      `gorm:"default:true" json:"enabled"`                        // 启用状态
-	ParseRateLimit    float64   `gorm:"default:0" json:"parse_rate_limit"`                 // 解析限流阈值速度（单位：requests/min，每分钟请求数）
-	DownloadRateLimit float64   `gorm:"default:0" json:"download_rate_limit"`              // 下载限流阈值速度（单位：MB/s，每秒兆字节数）
+	MachineName       string    `gorm:"size:255;not null" json:"machine_name"`    // 机器名（允许多条记录，用于轮询多个 cookie）
+	CookieContent     string    `gorm:"type:text;not null" json:"cookie_content"` // 完整的cookie内容（text格式）
+	Enabled           bool      `gorm:"default:true" json:"enabled"`              // 启用状态
+	ParseRateLimit    float64   `gorm:"default:0" json:"parse_rate_limit"`        // 解析限流阈值速度（单位：requests/min，每分钟请求数）
+	DownloadRateLimit float64   `gorm:"default:0" json:"download_rate_limit"`     // 下载限流阈值速度（单位：MB/s，每秒兆字节数）
 	CreatedAt         time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt         time.Time `gorm:"autoUpdateTime" json:"updated_at"`
 }
@@ -158,21 +160,21 @@ func (WorkerCookieConfig) TableName() string {
 
 // YoutubeTaskRecord 记录 YouTube 任务的详细信息（数据库表）
 type YoutubeTaskRecord struct {
-	ID            uint       `gorm:"primaryKey" json:"id"`                                               // 任务 ID，与 JobID 组成唯一索引
-	JobID         uint       `gorm:"index;not null" json:"job_id"`                                         // 关联的 YouTube Job ID
-	Status        string     `gorm:"type:varchar(50);default:'PENDING'" json:"status"`                   // PENDING, RUNNING, METADATA_FETCHED, COMPLETED, FAILED
-	WorkerID      string     `gorm:"size:255" json:"worker_id"`                                          // 处理该任务的 worker ID
-	URL           string     `gorm:"type:text" json:"url"`                                               // 原始的 YouTube URL
-	Title         string     `gorm:"type:text" json:"title"`                                             // 视频标题
-	VideoID       string     `gorm:"size:255;index" json:"video_id"`                                      // YouTube 视频 ID
-	AudioURL      string     `gorm:"type:text" json:"audio_url"`                                         // 音频下载 URL
-	AudioSize     int64      `gorm:"default:0" json:"audio_size"`                                       // 音频文件大小（字节）
-	VideoURL      string     `gorm:"type:text" json:"video_url"`                                         // 视频下载 URL
-	VideoSize     int64      `gorm:"default:0" json:"video_size"`                                        // 视频文件大小（字节）
-	ErrorMessage  string     `gorm:"type:text" json:"error_message"`                                      // 失败原因（如果失败）
-	CreatedAt     time.Time  `gorm:"autoCreateTime" json:"created_at"`
-	UpdatedAt     time.Time  `gorm:"autoUpdateTime" json:"updated_at"`
-	
+	ID           uint      `gorm:"primaryKey" json:"id"`                             // 任务 ID，与 JobID 组成唯一索引
+	JobID        uint      `gorm:"index;not null" json:"job_id"`                     // 关联的 YouTube Job ID
+	Status       string    `gorm:"type:varchar(50);default:'PENDING'" json:"status"` // PENDING, RUNNING, METADATA_FETCHED, COMPLETED, FAILED
+	WorkerID     string    `gorm:"size:255" json:"worker_id"`                        // 处理该任务的 worker ID
+	URL          string    `gorm:"type:text" json:"url"`                             // 原始的 YouTube URL
+	Title        string    `gorm:"type:text" json:"title"`                           // 视频标题
+	VideoID      string    `gorm:"size:255;index" json:"video_id"`                   // YouTube 视频 ID
+	AudioURL     string    `gorm:"type:text" json:"audio_url"`                       // 音频下载 URL
+	AudioSize    int64     `gorm:"default:0" json:"audio_size"`                      // 音频文件大小（字节）
+	VideoURL     string    `gorm:"type:text" json:"video_url"`                       // 视频下载 URL
+	VideoSize    int64     `gorm:"default:0" json:"video_size"`                      // 视频文件大小（字节）
+	ErrorMessage string    `gorm:"type:text" json:"error_message"`                   // 失败原因（如果失败）
+	CreatedAt    time.Time `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt    time.Time `gorm:"autoUpdateTime" json:"updated_at"`
+
 	// 关联的 Job
 	Job YoutubeJob `gorm:"foreignKey:JobID" json:"job,omitempty"`
 }

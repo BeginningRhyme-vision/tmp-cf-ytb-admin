@@ -54,15 +54,16 @@ type JobDelta struct {
 }
 
 const (
-	BufferSize              = 2000
-	FetchBatchSize          = 100
-	BufferLowWater          = 100 // Refill when below this
-	TxFetchBatchSize        = 1000
-	LockExpiration          = 30 * time.Second
-	DedupShards             = 256                // 去重 Hash 分成 256 片
-	TaskBucketSize          = 50000              // 任务 ZSet 每 5 万个 ID 分一个桶
-	TxBufferLogInterval     = 10 * time.Second   // Log every 10 seconds
-	LargeFileThresholdBytes = 1000 * 1024 * 1024 // 1GB
+	BufferSize                   = 2000
+	FetchBatchSize               = 100
+	BufferLowWater               = 100 // Refill when below this
+	TxFetchBatchSize             = 1000
+	LockExpiration               = 30 * time.Second
+	DedupShards                  = 256                // 去重 Hash 分成 256 片
+	TaskBucketSize               = 50000              // 任务 ZSet 每 5 万个 ID 分一个桶
+	TxBufferLogInterval          = 10 * time.Second   // Log every 10 seconds
+	LargeFileThresholdBytes      = 1000 * 1024 * 1024 // 1GB
+	IncrementalIdleScanThreshold = 2
 )
 
 var (
@@ -102,6 +103,144 @@ func getTaskBucketKey(jobID int64, taskID int64) string {
 	bucket := taskID / TaskBucketSize
 	return fmt.Sprintf("tx:job:%d:tasks:%d", jobID, bucket)
 }
+
+func getTxTaskKey(ctx context.Context, jobID int64, taskID int64) string {
+	if isJobSharded(ctx, jobID) {
+		return fmt.Sprintf("tx:task:%d:%d", jobID, taskID)
+	}
+	return fmt.Sprintf("tx:task:%d", taskID)
+}
+
+func loadAllTransferJobIDs() ([]int64, error) {
+	var jobIDs []int64
+	err := database.DB.Model(&models.TransferJob{}).Pluck("job_id", &jobIDs).Error
+	return jobIDs, err
+}
+
+func reactivateTransferJobOnPendingWork(jobID int64) {
+	database.DB.Exec(`
+		UPDATE transfer_jobs
+		SET
+			status = CASE
+				WHEN status IN (?, ?, ?) THEN ?
+				ELSE status
+			END,
+			consecutive_idle_scans = 0,
+			end_time = NULL,
+			duration_seconds = 0
+		WHERE job_id = ?
+	`,
+		models.StatusCompleted,
+		models.StatusPhasedCompleted,
+		models.StatusFailed,
+		models.StatusPending,
+		jobID,
+	)
+}
+
+func promoteTransferJobToRunning(jobID int64) {
+	database.DB.Exec(`
+		UPDATE transfer_jobs
+		SET
+			status = CASE
+				WHEN status IN (?, ?, ?, ?) THEN ?
+				ELSE status
+			END,
+			consecutive_idle_scans = 0,
+			end_time = NULL,
+			duration_seconds = 0
+		WHERE job_id = ?
+	`,
+		models.StatusPending,
+		models.StatusCompleted,
+		models.StatusPhasedCompleted,
+		models.StatusFailed,
+		models.StatusRunning,
+		jobID,
+	)
+}
+
+func markTransferTasksRunning(tasks []models.TransferTask, workerID string) error {
+	if len(tasks) == 0 {
+		return nil
+	}
+
+	type statusTransition struct {
+		jobID     int64
+		oldStatus string
+		newStatus string
+	}
+
+	ctx := context.Background()
+	pipe := database.RDB.Pipeline()
+	now := time.Now()
+	updatedJobIDs := make(map[int64]struct{})
+	transitions := make([]statusTransition, 0, len(tasks))
+
+	for i := range tasks {
+		oldStatus := tasks[i].Status
+		if oldStatus != "PENDING" {
+			continue
+		}
+
+		tasks[i].Status = "RUNNING"
+		tasks[i].WorkerID = workerID
+		tasks[i].UpdatedAt = now
+		if tasks[i].StartedAt.IsZero() {
+			tasks[i].StartedAt = now
+		}
+
+		data, err := json.Marshal(tasks[i])
+		if err != nil {
+			return err
+		}
+
+		taskKey := getTxTaskKey(ctx, tasks[i].JobID, tasks[i].ID)
+		pipe.Set(ctx, taskKey, data, 0)
+
+		transitions = append(transitions, statusTransition{
+			jobID:     tasks[i].JobID,
+			oldStatus: oldStatus,
+			newStatus: tasks[i].Status,
+		})
+		updatedJobIDs[tasks[i].JobID] = struct{}{}
+
+		dbTask := models.TransferTask{
+			ID:        tasks[i].ID,
+			JobID:     tasks[i].JobID,
+			Src:       tasks[i].Src,
+			Size:      tasks[i].Size,
+			Status:    tasks[i].Status,
+			WorkerID:  tasks[i].WorkerID,
+			StartedAt: tasks[i].StartedAt,
+			UpdatedAt: now,
+		}
+
+		if err := database.DB.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"status", "worker_id", "started_at", "updated_at",
+			}),
+		}).Create(&dbTask).Error; err != nil {
+			return err
+		}
+	}
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return err
+	}
+
+	for _, transition := range transitions {
+		trackTxStatusChange(transition.jobID, transition.oldStatus, transition.newStatus)
+	}
+
+	for jobID := range updatedJobIDs {
+		promoteTransferJobToRunning(jobID)
+	}
+
+	return nil
+}
+
 func fnv32(key string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(key))
@@ -397,7 +536,7 @@ func flushTxStats() {
 				success_count = GREATEST(0, success_count + ?), 
 				failed_count = GREATEST(0, failed_count + ?),
 				status = CASE 
-					WHEN status = 'PENDING' AND (GREATEST(0, running_count + ?)) > 0 THEN 'RUNNING'
+					WHEN status IN ('PENDING', 'PHASEDCOMPLETED') AND (GREATEST(0, running_count + ?)) > 0 THEN 'RUNNING'
 					ELSE status 
 				END
 			WHERE job_id = ?
@@ -1706,12 +1845,35 @@ func addShardedTransferTasks(jobID int64, inputs []TransferTaskInput) (int, erro
 
 	// Update job statistics
 	if len(newInputs) > 0 {
-		db := database.DB.Model(&models.TransferJob{}).Where("job_id = ?", jobID)
-		db.UpdateColumn("total_count", gorm.Expr("total_count + ?", len(newInputs)))
-		db.UpdateColumn("pending_count", gorm.Expr("pending_count + ?", len(newInputs)))
-		
 		if totalSizeBytes > 0 {
-			db.UpdateColumn("total_size_bytes", gorm.Expr("total_size_bytes + ?", totalSizeBytes))
+			database.DB.Exec(`
+				UPDATE transfer_jobs
+				SET
+					total_count = total_count + ?,
+					pending_count = pending_count + ?,
+					total_size_bytes = total_size_bytes + ?,
+					consecutive_idle_scans = 0,
+					status = CASE
+						WHEN status IN (?, ?, ?) THEN ?
+						ELSE status
+					END
+				WHERE job_id = ?
+			`, len(newInputs), len(newInputs), totalSizeBytes,
+				models.StatusCompleted, models.StatusPhasedCompleted, models.StatusFailed, models.StatusPending, jobID)
+		} else {
+			database.DB.Exec(`
+				UPDATE transfer_jobs
+				SET
+					total_count = total_count + ?,
+					pending_count = pending_count + ?,
+					consecutive_idle_scans = 0,
+					status = CASE
+						WHEN status IN (?, ?, ?) THEN ?
+						ELSE status
+					END
+				WHERE job_id = ?
+			`, len(newInputs), len(newInputs),
+				models.StatusCompleted, models.StatusPhasedCompleted, models.StatusFailed, models.StatusPending, jobID)
 		}
 	}
 
@@ -1835,12 +1997,35 @@ func addLegacyTransferTasks(jobID int64, inputs []TransferTaskInput) (int, error
 
 	// Update job statistics
 	if len(newInputs) > 0 {
-		db := database.DB.Model(&models.TransferJob{}).Where("job_id = ?", jobID)
-		db.UpdateColumn("total_count", gorm.Expr("total_count + ?", len(newInputs)))
-		db.UpdateColumn("pending_count", gorm.Expr("pending_count + ?", len(newInputs)))
-		
 		if totalSizeBytes > 0 {
-			db.UpdateColumn("total_size_bytes", gorm.Expr("total_size_bytes + ?", totalSizeBytes))
+			database.DB.Exec(`
+				UPDATE transfer_jobs
+				SET
+					total_count = total_count + ?,
+					pending_count = pending_count + ?,
+					total_size_bytes = total_size_bytes + ?,
+					consecutive_idle_scans = 0,
+					status = CASE
+						WHEN status IN (?, ?, ?) THEN ?
+						ELSE status
+					END
+				WHERE job_id = ?
+			`, len(newInputs), len(newInputs), totalSizeBytes,
+				models.StatusCompleted, models.StatusPhasedCompleted, models.StatusFailed, models.StatusPending, jobID)
+		} else {
+			database.DB.Exec(`
+				UPDATE transfer_jobs
+				SET
+					total_count = total_count + ?,
+					pending_count = pending_count + ?,
+					consecutive_idle_scans = 0,
+					status = CASE
+						WHEN status IN (?, ?, ?) THEN ?
+						ELSE status
+					END
+				WHERE job_id = ?
+			`, len(newInputs), len(newInputs),
+				models.StatusCompleted, models.StatusPhasedCompleted, models.StatusFailed, models.StatusPending, jobID)
 		}
 	}
 
@@ -2392,6 +2577,12 @@ func AcquireTransferTasks(c *gin.Context) {
 				}
 			}
 		}
+		if err := markTransferTasksRunning(tasks, req.WorkerID); err != nil {
+			log.Printf("[AcquireTransferTasks] Failed to mark tasks running: %v", err)
+			triggerTxRefill(jobIDs[0])
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mark tasks running"})
+			return
+		}
 		c.JSON(http.StatusOK, tasks)
 		return
 	}
@@ -2456,6 +2647,15 @@ func AcquireTransferTasks(c *gin.Context) {
 	}
 	bufferMutex.RUnlock()
 
+	if err := markTransferTasksRunning(tasks, req.WorkerID); err != nil {
+		log.Printf("[AcquireTransferTasks] Failed to mark tasks running: %v", err)
+		for _, jid := range jobIDs {
+			triggerTxRefill(jid)
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mark tasks running"})
+		return
+	}
+
 	log.Printf("[AcquireTransferTasks] Returning %d tasks to worker %s, buffer status: %v", len(tasks), req.WorkerID, bufferStatus)
 	c.JSON(http.StatusOK, tasks)
 }
@@ -2474,7 +2674,7 @@ func BatchUpdateTransfer(c *gin.Context) {
 	ctx := context.Background()
 	var keys []string
 	for _, u := range updates {
-		keys = append(keys, fmt.Sprintf("tx:task:%d:%d", u.JobID, u.ID))
+		keys = append(keys, getTxTaskKey(ctx, u.JobID, u.ID))
 	}
 	existingJSONs, err := database.RDB.MGet(ctx, keys...).Result()
 	if err != nil {
@@ -2486,7 +2686,7 @@ func BatchUpdateTransfer(c *gin.Context) {
 
 	for i, u := range updates {
 		var taskKey string
-		taskKey = fmt.Sprintf("tx:task:%d:%d", u.JobID, u.ID)
+		taskKey = getTxTaskKey(ctx, u.JobID, u.ID)
 
 		var oldStatus string = ""
 		val := existingJSONs[i]
@@ -2494,7 +2694,7 @@ func BatchUpdateTransfer(c *gin.Context) {
 			var existing models.TransferTask
 			if json.Unmarshal([]byte(str), &existing) == nil {
 				oldStatus = existing.Status
-				
+
 				if existing.Status != "COMPLETED" && u.Status == "COMPLETED" && existing.Size > 0 {
 					successSizeIncrements[u.JobID] += existing.Size
 				}
@@ -2526,6 +2726,11 @@ func BatchUpdateTransfer(c *gin.Context) {
 		// Track status change
 		if oldStatus != "" && oldStatus != u.Status {
 			trackTxStatusChange(u.JobID, oldStatus, u.Status)
+			if u.Status == "RUNNING" {
+				promoteTransferJobToRunning(u.JobID)
+			} else if u.Status == "PENDING" {
+				reactivateTransferJobOnPendingWork(u.JobID)
+			}
 		}
 
 		// Update Redis
@@ -2594,66 +2799,25 @@ func GetFailedTasksForRetry(c *gin.Context) {
 		return
 	}
 
-	ctx := context.Background()
 	failedTasks := []models.TransferTask{}
 
-	jobKeys, err := database.RDB.Keys(ctx, "tx:job:*:tasks").Result()
+	jobIDs, err := loadAllTransferJobIDs()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get job keys: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get transfer jobs: " + err.Error()})
 		return
 	}
 
-	if len(jobKeys) == 0 {
+	if len(jobIDs) == 0 {
 		c.JSON(http.StatusOK, failedTasks)
 		return
 	}
 
-	var jobIDs []int64
-	for _, key := range jobKeys {
-		var jid int64
-		n, _ := fmt.Sscanf(key, "tx:job:%d:tasks", &jid)
-		if n == 1 {
-			jobIDs = append(jobIDs, jid)
-		}
-	}
-
 	for _, jid := range jobIDs {
-		jobKey := fmt.Sprintf("tx:job:%d:tasks", jid)
-		ids, err := database.RDB.ZRange(ctx, jobKey, 0, -1).Result()
-		if err != nil || len(ids) == 0 {
+		var tasks []models.TransferTask
+		if err := database.DB.Where("job_id = ? AND status = ? AND retry_count < ?", jid, "FAILED", req.MaxRetryCount).Find(&tasks).Error; err != nil {
 			continue
 		}
-
-		var keys []string
-		for _, tid := range ids {
-			var taskID int64
-			fmt.Sscanf(tid, "%d", &taskID)
-			keys = append(keys, fmt.Sprintf("tx:task:%d:%d", jid, taskID))
-		}
-
-		results, err := database.RDB.MGet(ctx, keys...).Result()
-		if err != nil {
-			continue
-		}
-
-		for _, val := range results {
-			if val == nil {
-				continue
-			}
-			str, ok := val.(string)
-			if !ok {
-				continue
-			}
-
-			var task models.TransferTask
-			if err := json.Unmarshal([]byte(str), &task); err != nil {
-				continue
-			}
-
-			if task.Status == "FAILED" && task.RetryCount < req.MaxRetryCount {
-				failedTasks = append(failedTasks, task)
-			}
-		}
+		failedTasks = append(failedTasks, tasks...)
 	}
 
 	c.JSON(http.StatusOK, failedTasks)
@@ -2677,24 +2841,15 @@ func ResetTransferTask(c *gin.Context) {
 
 	ctx := context.Background()
 
-	jobKeys, err := database.RDB.Keys(ctx, "tx:job:*:tasks").Result()
+	jobIDs, err := loadAllTransferJobIDs()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get job keys: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get transfer jobs: " + err.Error()})
 		return
-	}
-
-	var jobIDs []int64
-	for _, key := range jobKeys {
-		var jid int64
-		n, _ := fmt.Sscanf(key, "tx:job:%d:tasks", &jid)
-		if n == 1 {
-			jobIDs = append(jobIDs, jid)
-		}
 	}
 
 	var found bool
 	for _, jid := range jobIDs {
-		taskKey := fmt.Sprintf("tx:task:%d:%d", jid, req.TaskID)
+		taskKey := getTxTaskKey(ctx, jid, req.TaskID)
 		val, err := database.RDB.Get(ctx, taskKey).Result()
 		if err != nil {
 			continue
@@ -2723,6 +2878,7 @@ func ResetTransferTask(c *gin.Context) {
 
 		// Track status change
 		trackTxStatusChange(jid, oldStatus, task.Status)
+		reactivateTransferJobOnPendingWork(jid)
 
 		// Sync to database
 		now := time.Now()

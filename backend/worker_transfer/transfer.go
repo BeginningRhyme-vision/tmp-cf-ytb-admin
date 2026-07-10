@@ -898,17 +898,10 @@ func getIntField(v reflect.Value, name string) int {
 }
 
 func updateJobStats(jobID int64, incSuccess, incFailed int) {
-	if incSuccess == 0 && incFailed == 0 {
-		return
-	}
-	statsMutex.Lock()
-	defer statsMutex.Unlock()
-
-	if _, ok := statsBuffer[jobID]; !ok {
-		statsBuffer[jobID] = &JobStatsDelta{}
-	}
-	statsBuffer[jobID].Success += incSuccess
-	statsBuffer[jobID].Failed += incFailed
+	// Job counters are derived from transfer task state transitions on backend-api.
+	_ = jobID
+	_ = incSuccess
+	_ = incFailed
 }
 
 type UpdateJobStatusRequest struct {

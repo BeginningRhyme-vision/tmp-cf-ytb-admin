@@ -36,14 +36,14 @@ func CreateTransferJob(c *gin.Context) {
 	job := req.TransferJob
 	job.Status = models.StatusPending
 
-	// If Incremental is selected but no interval is provided, default to 60s to ensure it acts as a periodic monitor
+	// If Incremental is selected but no interval is provided, default to 10 minutes.
 	if job.IsIncremental && job.PeriodicInterval <= 0 {
 		job.PeriodicInterval = 600
 	}
 
-	// Initial counts
-	job.TotalCount = len(req.Tasks)
-	job.PendingCount = len(req.Tasks)
+	// Task counters are maintained when tasks are actually inserted.
+	job.TotalCount = 0
+	job.PendingCount = 0
 
 	if err := database.DB.Create(&job).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -60,11 +60,9 @@ func CreateTransferJob(c *gin.Context) {
 			for _, t := range tasks {
 				inputs = append(inputs, TransferTaskInput{Src: t, Size: 0})
 			}
-			count, err := AddTransferTasksToJob(int64(jobID), inputs)
+			_, err := AddTransferTasksToJob(int64(jobID), inputs)
 			if err != nil {
 				fmt.Printf("Error adding tasks for transfer job %d: %v\n", jobID, err)
-			} else if count > 0 {
-				database.DB.Exec("UPDATE transfer_jobs SET total_count = total_count + ?, pending_count = pending_count + ? WHERE job_id = ?", count, count, jobID)
 			}
 		}(job.JobID, req.Tasks)
 	}
@@ -162,11 +160,11 @@ func GetTransferJob(c *gin.Context) {
 	}
 
 	var counts struct {
-		Total    int64
-		Pending  int64
-		Running  int64
-		Success  int64
-		Failed   int64
+		Total   int64
+		Pending int64
+		Running int64
+		Success int64
+		Failed  int64
 	}
 
 	database.DB.Model(&models.TransferTask{}).
@@ -198,11 +196,12 @@ func StartTransferJob(c *gin.Context) {
 	}
 
 	updates := map[string]interface{}{
-		"status":           models.StatusPending,
-		"start_time":       nil,
-		"end_time":         nil,
-		"duration_seconds": 0,
-		"result_message":   "",
+		"status":                 models.StatusPending,
+		"start_time":             nil,
+		"end_time":               nil,
+		"duration_seconds":       0,
+		"consecutive_idle_scans": 0,
+		"result_message":         "",
 	}
 
 	// 只有当任务是增量任务时，才重置 last_scan_time 和 last_scanned_key
@@ -252,7 +251,7 @@ func ListPendingTransferJobs(c *gin.Context) {
 	var jobs []models.TransferJob
 	if err := database.DB.Preload("Metadata").
 		Where("status = ?", models.StatusPending).
-		Or("status = ? AND periodic_interval > 0 AND (last_scan_time IS NULL OR last_scan_time < NOW() - make_interval(secs => periodic_interval))", models.StatusRunning).
+		Or("(status = ? OR status = ?) AND periodic_interval > 0 AND (last_scan_time IS NULL OR last_scan_time < NOW() - make_interval(secs => periodic_interval))", models.StatusRunning, models.StatusPhasedCompleted).
 		Find(&jobs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -365,9 +364,19 @@ func retryShardedTransferTasks(ctx context.Context, jobID int, initialStatus mod
 
 				var task models.TransferTask
 				if err := json.Unmarshal([]byte(str), &task); err == nil {
+					oldStatus := task.Status
 					if resetFailedTaskForRetry(&task) {
 						data, _ := json.Marshal(task)
 						pipe.Set(ctx, batchKeys[k], data, 0)
+						trackTxStatusChange(int64(jobID), oldStatus, task.Status)
+						database.DB.Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]interface{}{
+							"status":        task.Status,
+							"error_message": task.ErrorMessage,
+							"worker_id":     task.WorkerID,
+							"started_at":    task.StartedAt,
+							"completed_at":  task.CompletedAt,
+							"updated_at":    task.UpdatedAt,
+						})
 						hasUpdates = true
 						resetCount++
 					}
@@ -380,12 +389,10 @@ func retryShardedTransferTasks(ctx context.Context, jobID int, initialStatus mod
 	}
 
 	if resetCount > 0 {
-		database.DB.Exec("UPDATE transfer_jobs SET failed_count = failed_count - ?, pending_count = pending_count + ? WHERE job_id = ?", resetCount, resetCount, jobID)
-
 		// 重置新 Offset (不带 {})
 		database.RDB.Set(ctx, fmt.Sprintf("tx:job:%d:offset", jobID), 0, 0)
 
-		if initialStatus == models.StatusCompleted || initialStatus == models.StatusFailed {
+		if initialStatus == models.StatusCompleted || initialStatus == models.StatusFailed || initialStatus == models.StatusPhasedCompleted {
 			database.DB.Model(&models.TransferJob{JobID: uint(jobID)}).Update("status", models.StatusPending)
 		}
 	}
@@ -429,9 +436,19 @@ func retryLegacyTransferTasks(jobID int, initialStatus models.JobStatus) {
 
 			var task models.TransferTask
 			if err := json.Unmarshal([]byte(str), &task); err == nil {
+				oldStatus := task.Status
 				if resetFailedTaskForRetry(&task) {
 					data, _ := json.Marshal(task)
 					pipe.Set(ctx, keys[i], data, 0)
+					trackTxStatusChange(int64(jobID), oldStatus, task.Status)
+					database.DB.Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]interface{}{
+						"status":        task.Status,
+						"error_message": task.ErrorMessage,
+						"worker_id":     task.WorkerID,
+						"started_at":    task.StartedAt,
+						"completed_at":  task.CompletedAt,
+						"updated_at":    task.UpdatedAt,
+					})
 					hasUpdates = true
 					resetCount++
 				}
@@ -449,11 +466,9 @@ func retryLegacyTransferTasks(jobID int, initialStatus models.JobStatus) {
 	}
 
 	if resetCount > 0 {
-		database.DB.Exec("UPDATE transfer_jobs SET failed_count = failed_count - ?, pending_count = pending_count + ? WHERE job_id = ?", resetCount, resetCount, jobID)
-
 		database.RDB.Set(ctx, fmt.Sprintf("tx:job:%d:offset", jobID), 0, 0)
 
-		if initialStatus == models.StatusCompleted || initialStatus == models.StatusFailed {
+		if initialStatus == models.StatusCompleted || initialStatus == models.StatusFailed || initialStatus == models.StatusPhasedCompleted {
 			database.DB.Model(&models.TransferJob{JobID: uint(jobID)}).Update("status", models.StatusPending)
 		}
 	}
@@ -635,17 +650,36 @@ func RetryFailedTransferTasks(c *gin.Context) {
 }
 
 type UpdateJobStatusRequest struct {
-	Status         models.JobStatus `json:"status"`
-	LastScanTime   *time.Time       `json:"last_scan_time"`
-	LastScannedKey *string          `json:"last_scanned_key"`
-	ResultMessage  string           `json:"result_message"`
-	IncSuccess     int              `json:"inc_success"`
-	IncFailed      int              `json:"inc_failed"`
-	IncSuccessBytes int64           `json:"inc_success_bytes"`
-	StartTime      *time.Time       `json:"start_time"`
-	EndTime        *time.Time       `json:"end_time"`
-	TotalCount     *int             `json:"total_count"`
-	IncExecution   bool             `json:"inc_execution"`
+	Status              models.JobStatus `json:"status"`
+	LastScanTime        *time.Time       `json:"last_scan_time"`
+	LastScannedKey      *string          `json:"last_scanned_key"`
+	ResultMessage       string           `json:"result_message"`
+	IncSuccess          int              `json:"inc_success"`
+	IncFailed           int              `json:"inc_failed"`
+	IncSuccessBytes     int64            `json:"inc_success_bytes"`
+	StartTime           *time.Time       `json:"start_time"`
+	EndTime             *time.Time       `json:"end_time"`
+	TotalCount          *int             `json:"total_count"`
+	IncExecution        bool             `json:"inc_execution"`
+	ScanDiscoveredCount *int             `json:"scan_discovered_count"`
+}
+
+func getTransferJobActivityCounts(jobID uint) (int64, int64, error) {
+	var activeCount int64
+	if err := database.DB.Model(&models.TransferTask{}).
+		Where("job_id = ? AND status IN ?", jobID, []string{"PENDING", "RUNNING"}).
+		Count(&activeCount).Error; err != nil {
+		return 0, 0, err
+	}
+
+	var retryableFailedCount int64
+	if err := database.DB.Model(&models.TransferTask{}).
+		Where("job_id = ? AND status = ? AND retry_count < ?", jobID, "FAILED", 3).
+		Count(&retryableFailedCount).Error; err != nil {
+		return 0, 0, err
+	}
+
+	return activeCount, retryableFailedCount, nil
 }
 
 func UpdateTransferJobStatus(c *gin.Context) {
@@ -705,20 +739,61 @@ func UpdateTransferJobStatus(c *gin.Context) {
 
 	}
 
-	// Atomic counter updates
-	if req.IncSuccess > 0 || req.IncFailed > 0 {
-		totalDec := req.IncSuccess + req.IncFailed
-		err := database.DB.Exec("UPDATE transfer_jobs SET success_count = success_count + ?, failed_count = failed_count + ?, pending_count = GREATEST(0, pending_count - ?) WHERE job_id = ?", req.IncSuccess, req.IncFailed, totalDec, id).Error
-		if err != nil {
+	if req.IncExecution {
+		if err := database.DB.Exec("UPDATE transfer_jobs SET execution_count = execution_count + 1 WHERE job_id = ?", id).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 	}
 
 	if req.IncExecution {
-		if err := database.DB.Exec("UPDATE transfer_jobs SET execution_count = execution_count + 1 WHERE job_id = ?", id).Error; err != nil {
+		discoveredCount := 0
+		if req.ScanDiscoveredCount != nil {
+			discoveredCount = *req.ScanDiscoveredCount
+		}
+
+		activeCount, retryableFailedCount, err := getTransferJobActivityCounts(job.JobID)
+		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
+		}
+
+		if job.IsIncremental {
+			if discoveredCount == 0 && activeCount == 0 && retryableFailedCount == 0 {
+				if err := database.DB.Exec("UPDATE transfer_jobs SET consecutive_idle_scans = consecutive_idle_scans + 1 WHERE job_id = ?", id).Error; err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+					return
+				}
+
+				if err := database.DB.First(&job, id).Error; err != nil {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Job not found"})
+					return
+				}
+
+				if job.ConsecutiveIdleScans >= IncrementalIdleScanThreshold && job.Status != models.StatusStopped && job.Status != models.StatusFailed {
+					if err := database.DB.Model(&job).Updates(map[string]interface{}{
+						"status": models.StatusPhasedCompleted,
+					}).Error; err != nil {
+						c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+						return
+					}
+				}
+			} else {
+				if err := database.DB.Model(&job).Updates(map[string]interface{}{
+					"status":                 models.StatusRunning,
+					"consecutive_idle_scans": 0,
+				}).Error; err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+					return
+				}
+			}
+		} else if discoveredCount == 0 && activeCount == 0 && retryableFailedCount == 0 && job.Status == models.StatusRunning {
+			if err := database.DB.Model(&job).Updates(map[string]interface{}{
+				"status": models.StatusCompleted,
+			}).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
 		}
 	}
 
@@ -853,10 +928,7 @@ func AddTasksToTransferJob(c *gin.Context) {
 		return
 	}
 
-	// Update Job stats
 	if count > 0 {
-		database.DB.Exec("UPDATE transfer_jobs SET total_count = total_count + ?, pending_count = pending_count + ?, status = CASE WHEN status = 'COMPLETED' THEN 'RUNNING' ELSE status END WHERE job_id = ?", count, count, id)
-
 		// 关键：初始化并填充任务 buffer，让 worker 可以立即获取新任务
 		ensureTxBuffer(int64(id))
 		triggerTxRefill(int64(id))
@@ -873,7 +945,7 @@ type CreateYoutubeJobRequest struct {
 	DownloadMode           string   `json:"download_mode" form:"download_mode"`
 	VideoSelectionStrategy string   `json:"video_selection_strategy" form:"video_selection_strategy"`
 	MachineName            string   `json:"machine_name" form:"machine_name"` // 绑定的主机名，为空表示所有主机都可以处理
-	Tasks                  []string `json:"tasks" form:"-"` // List of URLs
+	Tasks                  []string `json:"tasks" form:"-"`                   // List of URLs
 }
 
 // YouTube URL 格式验证
@@ -973,24 +1045,24 @@ func CreateYoutubeJob(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		
+
 		// 验证 JSON 请求中的 tasks
 		if len(req.Tasks) > 0 {
 			validTasks, validationErrors := parseAndValidateTasks(req.Tasks, "JSON request")
-			
+
 			// 如果有格式错误，返回错误信息
 			if len(validationErrors) > 0 {
 				log.Printf("[CreateYoutubeJob] JSON request validation found %d errors out of %d tasks", len(validationErrors), len(req.Tasks))
 				c.JSON(http.StatusBadRequest, gin.H{
-					"error":            "Tasks contain invalid YouTube URL formats",
+					"error":             "Tasks contain invalid YouTube URL formats",
 					"validation_errors": validationErrors,
-					"valid_count":      len(validTasks),
-					"error_count":      len(validationErrors),
-					"total_lines":      len(req.Tasks),
+					"valid_count":       len(validTasks),
+					"error_count":       len(validationErrors),
+					"total_lines":       len(req.Tasks),
 				})
 				return
 			}
-			
+
 			req.Tasks = validTasks
 		}
 	} else if strings.Contains(contentType, "multipart/form-data") {
@@ -1025,16 +1097,16 @@ func CreateYoutubeJob(c *gin.Context) {
 
 			// 验证并解析文件内容
 			validTasks, validationErrors := parseAndValidateTasks(fileLines, "uploaded file")
-			
+
 			// 如果有格式错误，返回错误信息
 			if len(validationErrors) > 0 {
 				log.Printf("[CreateYoutubeJob] File validation found %d errors out of %d lines", len(validationErrors), len(fileLines))
 				c.JSON(http.StatusBadRequest, gin.H{
-					"error":            "File contains invalid YouTube URL formats",
+					"error":             "File contains invalid YouTube URL formats",
 					"validation_errors": validationErrors,
-					"valid_count":      len(validTasks),
-					"error_count":      len(validationErrors),
-					"total_lines":      len(fileLines),
+					"valid_count":       len(validTasks),
+					"error_count":       len(validationErrors),
+					"total_lines":       len(fileLines),
 				})
 				return
 			}
@@ -1050,16 +1122,16 @@ func CreateYoutubeJob(c *gin.Context) {
 		if manualTasks != "" {
 			lines := strings.Split(manualTasks, "\n")
 			validTasks, validationErrors := parseAndValidateTasks(lines, "manual input")
-			
+
 			// 如果有格式错误，返回错误信息
 			if len(validationErrors) > 0 {
 				log.Printf("[CreateYoutubeJob] Manual input validation found %d errors out of %d lines", len(validationErrors), len(lines))
 				c.JSON(http.StatusBadRequest, gin.H{
-					"error":            "Manual input contains invalid YouTube URL formats",
+					"error":             "Manual input contains invalid YouTube URL formats",
 					"validation_errors": validationErrors,
-					"valid_count":      len(validTasks),
-					"error_count":      len(validationErrors),
-					"total_lines":      len(lines),
+					"valid_count":       len(validTasks),
+					"error_count":       len(validationErrors),
+					"total_lines":       len(lines),
 				})
 				return
 			}
@@ -1097,16 +1169,16 @@ func CreateYoutubeJob(c *gin.Context) {
 
 		// 验证并解析文件内容
 		validTasks, validationErrors := parseAndValidateTasks(fileLines, "file URL")
-		
+
 		// 如果有格式错误，返回错误信息
 		if len(validationErrors) > 0 {
 			log.Printf("[CreateYoutubeJob] File URL validation found %d errors out of %d lines", len(validationErrors), len(fileLines))
 			c.JSON(http.StatusBadRequest, gin.H{
-				"error":            "File from URL contains invalid YouTube URL formats",
+				"error":             "File from URL contains invalid YouTube URL formats",
 				"validation_errors": validationErrors,
-				"valid_count":      len(validTasks),
-				"error_count":      len(validationErrors),
-				"total_lines":      len(fileLines),
+				"valid_count":       len(validTasks),
+				"error_count":       len(validationErrors),
+				"total_lines":       len(fileLines),
 			})
 			return
 		}
@@ -1152,13 +1224,13 @@ func CreateYoutubeJob(c *gin.Context) {
 					log.Printf("[CreateYoutubeJob] PANIC in async task addition for job %d: %v", jobID, r)
 				}
 			}()
-			
+
 			startTime := time.Now()
 			log.Printf("[CreateYoutubeJob] [Job %d] Starting AddTasksToJob with %d tasks", jobID, len(tasks))
-			
+
 			count, err := AddTasksToJob(jobID, tasks)
 			duration := time.Since(startTime)
-			
+
 			if err != nil {
 				log.Printf("[CreateYoutubeJob] ERROR: Failed to add tasks to Redis/DB for job %d: %v (took %v)", jobID, err, duration)
 				// 更新 Job 状态为失败（可选）
@@ -1188,15 +1260,15 @@ func ListYoutubeJobs(c *gin.Context) {
 	// 为每个 Job 从数据库查询最新的任务计数
 	for i := range jobs {
 		var counts struct {
-			Total    int64
-			Pending  int64
-			Running  int64
-			Success  int64
-			Failed   int64
-			Size     int64
+			Total       int64
+			Pending     int64
+			Running     int64
+			Success     int64
+			Failed      int64
+			Size        int64
 			SuccessSize int64
 		}
-		
+
 		database.DB.Model(&models.YoutubeTaskRecord{}).
 			Where("job_id = ?", jobs[i].ID).
 			Select(`
@@ -1209,7 +1281,7 @@ func ListYoutubeJobs(c *gin.Context) {
 				SUM(CASE WHEN status = 'COMPLETED' THEN COALESCE(audio_size, 0) + COALESCE(video_size, 0) ELSE 0 END) as success_size
 			`).
 			Scan(&counts)
-		
+
 		jobs[i].TotalCount = int(counts.Total)
 		jobs[i].PendingCount = int(counts.Pending)
 		jobs[i].RunningCount = int(counts.Running)
@@ -1237,18 +1309,18 @@ func GetYoutubeJob(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Job not found"})
 		return
 	}
-	
+
 	// 直接从数据库查询任务计数
 	var counts struct {
-		Total    int64
-		Pending  int64
-		Running  int64
-		Success  int64
-		Failed   int64
-		Size     int64
+		Total       int64
+		Pending     int64
+		Running     int64
+		Success     int64
+		Failed      int64
+		Size        int64
 		SuccessSize int64
 	}
-	
+
 	database.DB.Model(&models.YoutubeTaskRecord{}).
 		Where("job_id = ?", id).
 		Select(`
@@ -1261,7 +1333,7 @@ func GetYoutubeJob(c *gin.Context) {
 			SUM(CASE WHEN status = 'COMPLETED' THEN COALESCE(audio_size, 0) + COALESCE(video_size, 0) ELSE 0 END) as success_size
 		`).
 		Scan(&counts)
-	
+
 	// 更新 Job 的计数
 	job.TotalCount = int(counts.Total)
 	job.PendingCount = int(counts.Pending)
@@ -1270,7 +1342,7 @@ func GetYoutubeJob(c *gin.Context) {
 	job.FailedCount = int(counts.Failed)
 	job.TotalSizeBytes = counts.Size
 	job.SuccessSizeBytes = counts.SuccessSize
-	
+
 	c.JSON(http.StatusOK, job)
 }
 
@@ -1284,11 +1356,11 @@ func cleanupYoutubeJobRedis(ctx context.Context, jobID uint) {
 	if err == nil && len(taskIDs) > 0 {
 		// 获取 Job 的 machine_name 来确定队列名
 		jobMachineName := getJobMachineName(int64(jobID))
-		
+
 		// 确定需要清理的队列列表
 		var downloadQueues []string
 		var metadataQueues []string
-		
+
 		if jobMachineName != "" {
 			// Job 有指定的 machine_name，清理特定机器队列和 all 队列
 			downloadQueues = []string{
@@ -1304,25 +1376,25 @@ func cleanupYoutubeJobRedis(ctx context.Context, jobID uint) {
 			downloadQueues = []string{"queue:youtube:download_ready:all"}
 			metadataQueues = []string{"queue:youtube:metadata_retry:all"}
 		}
-		
+
 		pipe := database.RDB.Pipeline()
-		
+
 		// 从所有相关队列中移除任务 ID
 		for _, tid := range taskIDs {
 			// 删除任务详情
 			pipe.Del(ctx, fmt.Sprintf("task:%s", tid))
-			
+
 			// 从下载队列中移除（LRem 移除所有匹配的元素）
 			for _, queueName := range downloadQueues {
 				pipe.LRem(ctx, queueName, 0, tid) // 0 表示移除所有匹配的元素
 			}
-			
+
 			// 从 metadata 队列中移除
 			for _, queueName := range metadataQueues {
 				pipe.LRem(ctx, queueName, 0, tid)
 			}
 		}
-		
+
 		pipe.Exec(ctx)
 		log.Printf("[cleanupYoutubeJobRedis] Cleaned up %d tasks from queues for job %d (machine_name: %s)", len(taskIDs), jobID, jobMachineName)
 	}
@@ -1679,16 +1751,16 @@ func ResetYoutubeJobOffset(c *gin.Context) {
 		return
 	}
 
-	log.Printf("[ResetYoutubeJobOffset] Manually reset offset for job %d (Total: %d, Old Offset: %d, Pending: %d)", 
+	log.Printf("[ResetYoutubeJobOffset] Manually reset offset for job %d (Total: %d, Old Offset: %d, Pending: %d)",
 		jobID, total, offset, job.PendingCount)
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":     "Offset reset successfully",
-		"job_id":      jobID,
-		"total":       total,
-		"old_offset":  offset,
-		"new_offset":  0,
-		"pending":     job.PendingCount,
+		"message":    "Offset reset successfully",
+		"job_id":     jobID,
+		"total":      total,
+		"old_offset": offset,
+		"new_offset": 0,
+		"pending":    job.PendingCount,
 	})
 }
 
@@ -1864,10 +1936,10 @@ func DeleteFfmpegJob(c *gin.Context) {
 			pipe.Exec(ctx)
 		}
 
-	database.RDB.Del(ctx, jobKey)
-	database.RDB.Del(ctx, fmt.Sprintf("ff:job:%d:lock", jid))
-	database.RDB.Del(ctx, fmt.Sprintf("ff:job:%d:offset", jid))
-}(uint(id))
+		database.RDB.Del(ctx, jobKey)
+		database.RDB.Del(ctx, fmt.Sprintf("ff:job:%d:lock", jid))
+		database.RDB.Del(ctx, fmt.Sprintf("ff:job:%d:offset", jid))
+	}(uint(id))
 
 	c.JSON(http.StatusOK, gin.H{"status": "deleted"})
 }
@@ -1875,14 +1947,14 @@ func DeleteFfmpegJob(c *gin.Context) {
 // GetYoutubeQueueStats 获取 Redis 队列统计信息，按 job ID 分类聚合
 func GetYoutubeQueueStats(c *gin.Context) {
 	ctx := context.Background()
-	
+
 	// 1. 从数据库获取所有机器名
 	var configs []models.WorkerCookieConfig
 	if err := database.DB.Select("machine_name").Where("enabled = ?", true).Find(&configs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch machine names: " + err.Error()})
 		return
 	}
-	
+
 	machineNames := make([]string, 0, len(configs))
 	machineSet := make(map[string]bool)
 	for _, config := range configs {
@@ -1891,43 +1963,43 @@ func GetYoutubeQueueStats(c *gin.Context) {
 			machineSet[config.MachineName] = true
 		}
 	}
-	
+
 	// 2. 构建所有需要查询的队列列表
 	queueNames := []string{
 		"queue:youtube:download_ready:all",
 		"queue:youtube:metadata_retry:all",
 	}
-	
+
 	for _, machineName := range machineNames {
-		queueNames = append(queueNames, 
+		queueNames = append(queueNames,
 			fmt.Sprintf("queue:youtube:download_ready:%s", machineName),
 			fmt.Sprintf("queue:youtube:metadata_retry:%s", machineName),
 		)
 	}
-	
+
 	// 3. 统计每个队列中的任务，按 job ID（前3个数字）分类聚合，并记录队列名称
 	// 任务 ID 格式：jobID * 1000000 + sequence，例如 job 13 的任务 ID 是 13000001
 	// jobID -> queueType -> []queueInfo (包含队列名和数量)
 	jobStats := make(map[int]map[string][]map[string]interface{})
-	
+
 	for _, queueName := range queueNames {
 		length, err := database.RDB.LLen(ctx, queueName).Result()
 		if err != nil {
 			log.Printf("[GetYoutubeQueueStats] Failed to get length for queue %s: %v", queueName, err)
 			continue
 		}
-		
+
 		if length == 0 {
 			continue
 		}
-		
+
 		// 获取队列中的所有任务 ID
 		taskIDs, err := database.RDB.LRange(ctx, queueName, 0, -1).Result()
 		if err != nil {
 			log.Printf("[GetYoutubeQueueStats] Failed to get tasks from queue %s: %v", queueName, err)
 			continue
 		}
-		
+
 		// 确定队列类型
 		var queueType string
 		if strings.Contains(queueName, "download_ready") {
@@ -1937,7 +2009,7 @@ func GetYoutubeQueueStats(c *gin.Context) {
 		} else {
 			continue
 		}
-		
+
 		// 提取机器名（如果有）
 		machineName := ""
 		if strings.HasSuffix(queueName, ":all") {
@@ -1948,7 +2020,7 @@ func GetYoutubeQueueStats(c *gin.Context) {
 				machineName = parts[3]
 			}
 		}
-		
+
 		// 按 job ID 分类统计，并记录队列信息
 		jobTaskCount := make(map[int]int)
 		for _, taskIDStr := range taskIDs {
@@ -1956,12 +2028,12 @@ func GetYoutubeQueueStats(c *gin.Context) {
 			if err != nil {
 				continue
 			}
-			
+
 			// 提取 job ID：任务 ID 的前3个数字（例如 13000001 -> 13）
 			jobID := int(taskID / 1000000)
 			jobTaskCount[jobID]++
 		}
-		
+
 		// 为每个 job 记录队列信息
 		for jobID, count := range jobTaskCount {
 			if jobStats[jobID] == nil {
@@ -1971,19 +2043,19 @@ func GetYoutubeQueueStats(c *gin.Context) {
 				jobStats[jobID][queueType] = make([]map[string]interface{}, 0)
 			}
 			jobStats[jobID][queueType] = append(jobStats[jobID][queueType], map[string]interface{}{
-				"queue_name": queueName,
+				"queue_name":   queueName,
 				"machine_name": machineName,
-				"count": count,
+				"count":        count,
 			})
 		}
 	}
-	
+
 	// 4. 构建返回结果
 	result := make([]map[string]interface{}, 0)
 	for jobID, stats := range jobStats {
 		downloadQueues := stats["download_ready"]
 		metadataQueues := stats["metadata_retry"]
-		
+
 		downloadTotal := 0
 		metadataTotal := 0
 		for _, q := range downloadQueues {
@@ -1996,21 +2068,21 @@ func GetYoutubeQueueStats(c *gin.Context) {
 				metadataTotal += count
 			}
 		}
-		
+
 		result = append(result, map[string]interface{}{
 			"job_id":          jobID,
 			"download_ready":  downloadTotal,
 			"download_queues": downloadQueues,
-			"metadata_retry":   metadataTotal,
+			"metadata_retry":  metadataTotal,
 			"metadata_queues": metadataQueues,
 			"total":           downloadTotal + metadataTotal,
 		})
 	}
-	
+
 	// 确保总是返回正确的数据结构，即使没有数据
 	c.JSON(http.StatusOK, gin.H{
-		"stats":         result,
-		"total_queues":  len(queueNames),
+		"stats":          result,
+		"total_queues":   len(queueNames),
 		"total_machines": len(machineNames),
 	})
 }

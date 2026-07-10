@@ -1,5 +1,7 @@
 import { AwsClient } from "aws4fetch";
 
+const awsClientCache = new Map();
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -19,6 +21,28 @@ function getDestinationCredentials(env, destUrl) {
   const accessKeyId = env[`${s3Host}_ak`] || env.AWS_ACCESS_KEY_ID;
   const secretAccessKey = env[`${s3Host}_sk`] || env.AWS_SECRET_ACCESS_KEY;
   return { s3Host, accessKeyId, secretAccessKey };
+}
+
+function getAwsClient({ accessKeyId, secretAccessKey, service = "s3", region = "auto", endpoint }) {
+  const cacheKey = [accessKeyId, secretAccessKey, service, region, endpoint || ""].join("\n");
+  let client = awsClientCache.get(cacheKey);
+  if (client) {
+    return client;
+  }
+
+  const clientOptions = {
+    accessKeyId,
+    secretAccessKey,
+    service,
+    region,
+  };
+  if (endpoint) {
+    clientOptions.endpoint = endpoint;
+  }
+
+  client = new AwsClient(clientOptions);
+  awsClientCache.set(cacheKey, client);
+  return client;
 }
 
 function createTimeoutController(timeoutMs) {
@@ -152,32 +176,14 @@ async function processDownloadMessage(task, env) {
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0'
     ];
     const randomUA = userAgents[Math.floor(Math.random() * userAgents.length)];
-    
-    const isChrome = randomUA.includes('Chrome');
-    const isWindows = randomUA.includes('Windows');
-    
+
     const sourceHeaders = {
       'Range': `bytes=${start}-${end}`,
       'User-Agent': randomUA,
       'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br, zstd',
-      'Connection': 'keep-alive',
       'Origin': 'https://www.youtube.com',
       'Referer': 'https://www.youtube.com/',
-      'Sec-Fetch-Dest': 'empty',
-      'Sec-Fetch-Mode': 'cors',
-      'Sec-Fetch-Site': 'cross-site',
-      'DNT': '1'
     };
-
-    if (isChrome) {
-      const chVersion = randomUA.match(/Chrome\/(\d+)/)?.[1] || '122';
-      const platform = isWindows ? '"Windows"' : '"macOS"';
-      sourceHeaders['sec-ch-ua'] = `"Chromium";v="${chVersion}", "Not(A:Brand";v="24", "Google Chrome";v="${chVersion}"`;
-      sourceHeaders['sec-ch-ua-mobile'] = '?0';
-      sourceHeaders['sec-ch-ua-platform'] = platform;
-    }
 
     let r2KeyUrl = r2Key;
     const destUrl = new URL(r2KeyUrl);
@@ -196,7 +202,7 @@ async function processDownloadMessage(task, env) {
         throw new Error(`Missing required environment variables for destination S3 (${s3Host}): ${s3Host}_ak/${s3Host}_sk or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY`);
       }
 
-      destAwsClient = new AwsClient({
+      destAwsClient = getAwsClient({
         accessKeyId,
         secretAccessKey,
         service: "s3",
@@ -399,7 +405,7 @@ async function processMessage(task, env) {
     }
     const sourceUrl = new URL(r2KeyUrl);
 
-    const sourceAwsClient = new AwsClient({
+    const sourceAwsClient = getAwsClient({
       accessKeyId: env.SOURCE_ACCESS_KEY_ID,
       secretAccessKey: env.SOURCE_SECRET_ACCESS_KEY,
       service: "s3",
@@ -414,7 +420,7 @@ async function processMessage(task, env) {
       throw new Error(`Missing required environment variables for destination S3 (${s3Host}): ${s3Host}_ak/${s3Host}_sk or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY`);
     }
 
-    const destAwsClient = new AwsClient({
+    const destAwsClient = getAwsClient({
       accessKeyId: destAccessKey,
       secretAccessKey: destSecretKey,
       region: env.AWS_REGION || "auto",
@@ -490,6 +496,14 @@ async function processMessage(task, env) {
           }
 
           const etag = s3Response.headers.get("etag") || s3Response.headers.get("ETag");
+          if (!etag) {
+            if (attempt < maxAttempts) {
+              console.error(`Upload ok but missing etag for ${safeKey} part=${partNumber} attempt=${attempt}/${maxAttempts}`)
+              await sleep(backoffMs(attempt));
+              continue;
+            }
+            throw createHttpError(502, `No ETag found in S3 response for uploadId=${uploadId} part=${partNumber}`);
+          }
           console.log(`Copy success for ${safeKey} part=${partNumber} etag=${etag || ""}`)
           return { etag };
         } catch (uploadErr) {

@@ -14,7 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
-	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,11 +59,6 @@ type cachedJob struct {
 	expiry time.Time
 }
 
-type JobStatsDelta struct {
-	Success int
-	Failed  int
-}
-
 var (
 	jobCache                 sync.Map // JobID -> cachedJob
 	httpClient               *http.Client
@@ -82,12 +77,10 @@ var (
 	minThroughputMBPS        int
 	chunkReadTimeoutSecs     int
 	transferServiceRetries   int
+	s3ClientMaxConnections   int
 
 	s3Clients sync.Map // Endpoint -> *s3.Client (Cache for Destinations)
 	srcClient *s3.Client
-
-	statsBuffer = make(map[int64]*JobStatsDelta)
-	statsMutex  sync.Mutex
 
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
@@ -109,6 +102,7 @@ var (
 	effectiveWorkerCount     int32
 	effectivePartConcurrency int32
 	activeWorkerCount        int32
+	activePartSlotCount      int32
 
 	// Performance metrics for adaptive control
 	recentLatencies            *list.List
@@ -278,6 +272,10 @@ func runTransfer() {
 	minThroughputMBPS = getEnvInt("TRANSFER_MIN_THROUGHPUT_MBPS", DefaultMinThroughputMBPS)
 	chunkReadTimeoutSecs = getEnvInt("TRANSFER_CHUNK_READ_TIMEOUT_SECS", DefaultChunkReadTimeoutSecs)
 	transferServiceRetries = getEnvInt("TRANSFER_SERVICE_RETRY_ATTEMPTS", DefaultTransferServiceRetries)
+	s3ClientMaxConnections = maxConnections
+	if s3ClientMaxConnections < 1 {
+		s3ClientMaxConnections = DefaultMaxConnections
+	}
 
 	// Adaptive Concurrency Control Configuration
 	adaptiveConcurrencyEnabled = getEnvBool("TRANSFER_ADAPTIVE_CONCURRENCY_ENABLED", DefaultAdaptiveConcurrencyEnabled)
@@ -349,7 +347,6 @@ func runTransfer() {
 	}
 
 	initSourceClient()
-	initStatsFlusher()
 	initConnPoolMetrics()
 
 	log.Println("Transfer Worker Started")
@@ -515,25 +512,35 @@ func acquirePartSlot(sem chan struct{}) bool {
 		}
 		return false
 	}
+
+	active := atomic.AddInt32(&activePartSlotCount, 1)
+	if active > effective {
+		atomic.AddInt32(&activePartSlotCount, -1)
+		if shouldLogPartSlotStatus() {
+			log.Printf("[Adaptive] Part slot REJECTED: active=%d, effective=%d", active, effective)
+		}
+		return false
+	}
+
 	select {
 	case sem <- struct{}{}:
 		if shouldLogPartSlotStatus() {
-			log.Printf("[Adaptive] Part slot ACQUIRED: effective=%d", effective)
+			log.Printf("[Adaptive] Part slot ACQUIRED: active=%d, effective=%d", active, effective)
 		}
 		return true
 	default:
-		select {
-		case sem <- struct{}{}:
-			if shouldLogPartSlotStatus() {
-				log.Printf("[Adaptive] Part slot ACQUIRED (delayed): effective=%d", effective)
-			}
-			return true
-		default:
-			if shouldLogPartSlotStatus() {
-				log.Printf("[Adaptive] Part slot REJECTED: semaphore full, effective=%d", effective)
-			}
-			return false
+		atomic.AddInt32(&activePartSlotCount, -1)
+		if shouldLogPartSlotStatus() {
+			log.Printf("[Adaptive] Part slot REJECTED: semaphore full, active=%d, effective=%d", active, effective)
 		}
+		return false
+	}
+}
+
+func releasePartSlot(sem chan struct{}) {
+	<-sem
+	if adaptiveConcurrencyEnabled {
+		atomic.AddInt32(&activePartSlotCount, -1)
 	}
 }
 
@@ -795,53 +802,6 @@ func validateTimeoutConfig(min, max, throughput int) bool {
 	return true
 }
 
-func initStatsFlusher() {
-	shutdownWg.Add(1)
-	go func() {
-		defer shutdownWg.Done()
-
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-shutdownCtx.Done():
-				log.Println("Stats flusher stopping...")
-				return
-			case <-ticker.C:
-				flushStats()
-			}
-		}
-	}()
-}
-
-func flushStats() {
-	statsMutex.Lock()
-	if len(statsBuffer) == 0 {
-		statsMutex.Unlock()
-		return
-	}
-
-	log.Printf("[Stats] Active goroutines: %d, LargeFiles: %d, SmallFiles: %d",
-		runtime.NumGoroutine(),
-		atomic.LoadInt32(&activeLargeFileCount),
-		atomic.LoadInt32(&activeSmallFileCount))
-
-	snapshot := make(map[int64]JobStatsDelta)
-	for k, v := range statsBuffer {
-		if v.Success > 0 || v.Failed > 0 {
-			snapshot[k] = *v
-		}
-	}
-	// Reset buffer
-	statsBuffer = make(map[int64]*JobStatsDelta)
-	statsMutex.Unlock()
-
-	for jobID, delta := range snapshot {
-		sendJobStatsUpdate(jobID, delta.Success, delta.Failed)
-	}
-}
-
 func initConnPoolMetrics() {
 	shutdownWg.Add(1)
 	go func() {
@@ -905,35 +865,6 @@ func updateJobStats(jobID int64, incSuccess, incFailed int) {
 	_ = jobID
 	_ = incSuccess
 	_ = incFailed
-}
-
-type UpdateJobStatusRequest struct {
-	Status        string     `json:"status,omitempty"`
-	LastScanTime  *time.Time `json:"last_scan_time,omitempty"`
-	ResultMessage string     `json:"result_message,omitempty"`
-	IncSuccess    int        `json:"inc_success,omitempty"`
-	IncFailed     int        `json:"inc_failed,omitempty"`
-}
-
-func sendJobStatsUpdate(jobID int64, incSuccess, incFailed int) {
-	reqPayload := UpdateJobStatusRequest{
-		IncSuccess: incSuccess,
-		IncFailed:  incFailed,
-	}
-	data, _ := json.Marshal(reqPayload)
-
-	req, _ := http.NewRequest("PATCH", fmt.Sprintf("%s/jobs/%d/status", apiBaseURL, jobID), bytes.NewBuffer(data))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		log.Printf("Failed to update job stats for job %d: %v", jobID, err)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		log.Printf("Failed to update job stats for job %d: status %d", jobID, resp.StatusCode)
-	}
 }
 
 func processTask(t TransferTask) {
@@ -1370,7 +1301,7 @@ func transferFile(ctx context.Context, srcURL string, dstClient *s3.Client, dstB
 				case <-time.After(500 * time.Millisecond):
 				}
 			}
-			defer func() { <-sem }()
+			defer releasePartSlot(sem)
 
 			partSizeBytes := e - s + 1
 			partTimeout := calculatePartTimeout(partSizeBytes)
@@ -1409,13 +1340,9 @@ func transferFile(ctx context.Context, srcURL string, dstClient *s3.Client, dstB
 	default:
 	}
 
-	for i := 0; i < len(completedParts); i++ {
-		for j := i + 1; j < len(completedParts); j++ {
-			if *completedParts[i].PartNumber > *completedParts[j].PartNumber {
-				completedParts[i], completedParts[j] = completedParts[j], completedParts[i]
-			}
-		}
-	}
+	sort.Slice(completedParts, func(i, j int) bool {
+		return aws.ToInt32(completedParts[i].PartNumber) < aws.ToInt32(completedParts[j].PartNumber)
+	})
 
 	completeCtx, completeCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer completeCancel()
@@ -1424,6 +1351,23 @@ func transferFile(ctx context.Context, srcURL string, dstClient *s3.Client, dstB
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: completedParts},
 	})
 	return err
+}
+
+func waitForTransferRetry(ctx context.Context, attempt int) error {
+	delay := time.Duration(attempt) * time.Second
+	if delay <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func callTransferService(ctx context.Context, srcUrl, dstUrl string, size, offset int64, uploadID string, partNum int) (string, error) {
@@ -1459,13 +1403,13 @@ func callTransferService(ctx context.Context, srcUrl, dstUrl string, size, offse
 		resp, err := transferClient.Do(req)
 		if err != nil {
 			lastErr = err
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			default:
-				time.Sleep(time.Duration(i+1) * time.Second)
-				continue
+			if i+1 >= attempts {
+				break
 			}
+			if err := waitForTransferRetry(ctx, i+1); err != nil {
+				return "", err
+			}
+			continue
 		}
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -1473,43 +1417,17 @@ func callTransferService(ctx context.Context, srcUrl, dstUrl string, size, offse
 		if resp.StatusCode == 200 {
 			var res map[string]interface{}
 			if err := json.Unmarshal(respBody, &res); err != nil {
-				lastErr = fmt.Errorf("decode response failed: %w", err)
-				select {
-				case <-ctx.Done():
-					return "", ctx.Err()
-				default:
-					time.Sleep(time.Duration(i+1) * time.Second)
-					continue
-				}
+				return "", fmt.Errorf("decode response failed: %w", err)
 			}
-			if etag, ok := res["etag"].(string); ok {
+			if etag, ok := res["etag"].(string); ok && etag != "" {
 				return etag, nil
 			}
-			lastErr = fmt.Errorf("etag missing in response")
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			default:
-				time.Sleep(time.Duration(i+1) * time.Second)
-				continue
-			}
+			return "", fmt.Errorf("etag missing in response")
 		}
 		lastErr = fmt.Errorf("status %d body %s", resp.StatusCode, string(respBody))
-		if !isRetryableTransferServiceStatus(resp.StatusCode) {
-			return "", lastErr
-		}
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		default:
-			time.Sleep(time.Duration(i+1) * time.Second)
-		}
+		return "", lastErr
 	}
 	return "", fmt.Errorf("service call failed: %v", lastErr)
-}
-
-func isRetryableTransferServiceStatus(status int) bool {
-	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
 }
 
 func constructVirtualHostURL(endpointStr, bucket, key string) (string, error) {
@@ -1580,10 +1498,15 @@ func createS3Client(endpoint, ak, sk string) (*s3.Client, error) {
 
 	baseEndpoint := fmt.Sprintf("%s://%s", u.Scheme, host)
 
+	maxIdleConnsPerHost := s3ClientMaxConnections / 2
+	if maxIdleConnsPerHost < 1 {
+		maxIdleConnsPerHost = 1
+	}
+
 	httpTransport := &http.Transport{
-		MaxIdleConns:        512,
-		MaxIdleConnsPerHost: 256,
-		MaxConnsPerHost:     512,
+		MaxIdleConns:        s3ClientMaxConnections,
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+		MaxConnsPerHost:     s3ClientMaxConnections,
 		IdleConnTimeout:     300 * time.Second,
 		ForceAttemptHTTP2:   true,
 		DialContext: (&net.Dialer{

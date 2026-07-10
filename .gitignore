@@ -55,3 +55,12 @@ config_local_db.yaml
 *cookies.txt
 check_queue.sh
 debug_queue.py
+
+# Compiled binaries
+*.exe
+backend/go-app/unbound-future-backend
+backend/worker_transfer/worker-transfer
+backend/worker_downloader/worker-downloader
+backend/proxy_tester/proxy_tester
+backend/worker_ffmpeg/worker-ffmpeg
+backend/worker_ffmpeg/scanner

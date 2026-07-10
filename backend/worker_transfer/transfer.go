@@ -93,61 +93,61 @@ var (
 	shutdownWg     sync.WaitGroup
 
 	// Adaptive Concurrency Control
-	adaptiveConcurrencyEnabled         bool
-	minWorkers                         int
-	maxWorkers                         int
-	concurrencyIncreaseStep            int
-	concurrencyDecreaseFactor          float64
-	errorRateThreshold                 float64
-	avgLatencyThresholdMS              int
-	connPoolUtilizationThreshold       float64
-	concurrencyAdjustIntervalSecs      int
-	concurrencyCooldownSecs            int
-	maxLatencySamples                  int
+	adaptiveConcurrencyEnabled    bool
+	minWorkers                    int
+	maxWorkers                    int
+	concurrencyIncreaseStep       int
+	concurrencyDecreaseFactor     float64
+	errorRateThreshold            float64
+	avgLatencyThresholdMS         int
+	connPoolUtilizationThreshold  float64
+	concurrencyAdjustIntervalSecs int
+	concurrencyCooldownSecs       int
+	maxLatencySamples             int
 
-	effectiveWorkerCount       int32
-	effectivePartConcurrency   int32
-	activeWorkerCount          int32
+	effectiveWorkerCount     int32
+	effectivePartConcurrency int32
+	activeWorkerCount        int32
 
 	// Performance metrics for adaptive control
-	recentLatencies         *list.List
-	recentLatenciesMutex    sync.Mutex
-	recentErrors            int32
-	recentTotal             int32
+	recentLatencies            *list.List
+	recentLatenciesMutex       sync.Mutex
+	recentErrors               int32
+	recentTotal                int32
 	currentConnPoolUtilization float64
 
 	// Sliding window metrics
-	windowErrors            int32
-	windowTotal             int32
-	windowMutex             sync.Mutex
+	windowErrors int32
+	windowTotal  int32
+	windowMutex  sync.Mutex
 
 	// Cooldown tracking
-	lastDecreaseTime        time.Time
-	lastDecreaseTimeMutex   sync.Mutex
+	lastDecreaseTime      time.Time
+	lastDecreaseTimeMutex sync.Mutex
 
 	// Log throttling - limit slot status logs to avoid spamming
-	lastWorkerSlotLogTime   time.Time
-	workerSlotLogMutex      sync.Mutex
-	
-	lastLargeFileWaitLogTime   time.Time
-	largeFileWaitLogMutex      sync.Mutex
-	lastTaskProcessLogTime     time.Time
-	taskProcessLogMutex        sync.Mutex
-	lastPartSlotLogTime     time.Time
-	partSlotLogMutex        sync.Mutex
-	slotLogThrottleSecs     int
+	lastWorkerSlotLogTime time.Time
+	workerSlotLogMutex    sync.Mutex
+
+	lastLargeFileWaitLogTime time.Time
+	largeFileWaitLogMutex    sync.Mutex
+	lastTaskProcessLogTime   time.Time
+	taskProcessLogMutex      sync.Mutex
+	lastPartSlotLogTime      time.Time
+	partSlotLogMutex         sync.Mutex
+	slotLogThrottleSecs      int
 
 	// Large file concurrency control
-	largeFileThresholdBytes  int64
-	maxLargeFiles            int
-	maxRetryLargeFiles       int
-	activeLargeFileCount     int32
-	activeSmallFileCount     int32
+	largeFileThresholdBytes   int64
+	maxLargeFiles             int
+	maxRetryLargeFiles        int
+	activeLargeFileCount      int32
+	activeSmallFileCount      int32
 	activeRetryLargeFileCount int32
-	
+
 	// Per-job large file tracking for fair distribution
 	// Use sync.Map + atomic.Int32 to avoid global lock contention
-	jobLargeFileCounts  sync.Map
+	jobLargeFileCounts sync.Map
 
 	// Metrics
 	BytesTransferred = promauto.NewCounter(prometheus.CounterOpts{
@@ -223,20 +223,20 @@ const (
 	DefaultMinThroughputMBPS        = 2
 	DefaultChunkReadTimeoutSecs     = 30
 
-	DefaultAdaptiveConcurrencyEnabled     = true
-	DefaultMinWorkers                     = 8
-	DefaultConcurrencyIncreaseStep        = 1
-	DefaultConcurrencyDecreaseFactor      = 0.5
-	DefaultErrorRateThreshold             = 0.05
-	DefaultAvgLatencyThresholdMS          = 2000
-	DefaultConnPoolUtilizationThreshold   = 0.8
-	DefaultConcurrencyAdjustIntervalSecs  = 10
-	DefaultConcurrencyCooldownSecs        = 30
-	DefaultMaxLatencySamples              = 500
+	DefaultAdaptiveConcurrencyEnabled    = true
+	DefaultMinWorkers                    = 8
+	DefaultConcurrencyIncreaseStep       = 1
+	DefaultConcurrencyDecreaseFactor     = 0.5
+	DefaultErrorRateThreshold            = 0.05
+	DefaultAvgLatencyThresholdMS         = 2000
+	DefaultConnPoolUtilizationThreshold  = 0.8
+	DefaultConcurrencyAdjustIntervalSecs = 10
+	DefaultConcurrencyCooldownSecs       = 30
+	DefaultMaxLatencySamples             = 500
 
-	DefaultLargeFileThresholdMB           = 1000
-	DefaultMaxLargeFiles                  = 36
-	DefaultMaxRetryLargeFiles             = 36
+	DefaultLargeFileThresholdMB = 1000
+	DefaultMaxLargeFiles        = 36
+	DefaultMaxRetryLargeFiles   = 36
 )
 
 func runTransfer() {
@@ -354,8 +354,8 @@ func runTransfer() {
 	taskChan := make(chan TransferTask, taskBufferSize)
 
 	// Start Fetcher
+	shutdownWg.Add(1)
 	go func() {
-		shutdownWg.Add(1)
 		defer shutdownWg.Done()
 
 		for {
@@ -443,7 +443,7 @@ func calculateDynamicTimeout(size int64, retryCount int) time.Duration {
 	}
 
 	calculated := time.Duration(size/(int64(minThroughputMBPS)*1024*1024)) * time.Second
-	
+
 	if retryCount > 0 {
 		shift := retryCount
 		if shift > 30 {
@@ -793,8 +793,8 @@ func validateTimeoutConfig(min, max, throughput int) bool {
 }
 
 func initStatsFlusher() {
+	shutdownWg.Add(1)
 	go func() {
-		shutdownWg.Add(1)
 		defer shutdownWg.Done()
 
 		ticker := time.NewTicker(3 * time.Second)
@@ -818,7 +818,7 @@ func flushStats() {
 		statsMutex.Unlock()
 		return
 	}
-	
+
 	log.Printf("[Stats] Active goroutines: %d, LargeFiles: %d, SmallFiles: %d",
 		runtime.NumGoroutine(),
 		atomic.LoadInt32(&activeLargeFileCount),
@@ -840,8 +840,8 @@ func flushStats() {
 }
 
 func initConnPoolMetrics() {
+	shutdownWg.Add(1)
 	go func() {
-		shutdownWg.Add(1)
 		defer shutdownWg.Done()
 
 		ticker := time.NewTicker(5 * time.Second)
@@ -942,7 +942,7 @@ func sendJobStatsUpdate(jobID int64, incSuccess, incFailed int) {
 
 func processTask(t TransferTask) {
 	start := time.Now()
-	
+
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[Panic] Task %d panicked: %v", t.ID, r)
@@ -991,6 +991,29 @@ func processTask(t TransferTask) {
 
 	log.Printf("Processing Task %d (Job %d): %s -> %s", t.ID, t.JobID, t.Src, dstDir)
 
+	if t.RetryCount > 0 {
+		srcBucket := getBucketFromEndpoint(cfg.Storage.Src.Endpoint)
+		srcClient, err := createS3Client(cfg.Storage.Src.Endpoint, cfg.Storage.Src.AccessKey, cfg.Storage.Src.SecretKey)
+		if err != nil {
+			log.Printf("Failed to create source S3 client for task %d: %v", t.ID, err)
+		} else {
+			headCtx, headCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer headCancel()
+			_, err := srcClient.HeadObject(headCtx, &s3.HeadObjectInput{
+				Bucket: aws.String(srcBucket),
+				Key:    aws.String(t.Src),
+			})
+			if err != nil {
+				log.Printf("[SRC_DELETED] Task %d (Job %d): Source file '%s' no longer exists, marking as COMPLETED. Error: %v", t.ID, t.JobID, t.Src, err)
+				updateTaskStatusWithRetry(t, "COMPLETED", "Source object no longer exists, skipping")
+				updateJobStats(t.JobID, 1, 0)
+				TasksTransferred.WithLabelValues("success").Inc()
+				recordTransferResult(true)
+				return
+			}
+		}
+	}
+
 	if t.Size >= largeFileThresholdBytes {
 		isRetry := t.RetryCount > 0
 		for {
@@ -1006,15 +1029,15 @@ func processTask(t TransferTask) {
 			if v, ok := jobLargeFileCounts.Load(t.JobID); ok {
 				jobCurrent = v.(int32)
 			}
-			
+
 			maxPerJob := int32(maxLargeFiles) / int32(jobCount)
 			if maxPerJob < 1 {
 				maxPerJob = 1
 			}
-			
+
 			globalCurrent := atomic.LoadInt32(&activeLargeFileCount)
 			canProceed := jobCurrent < maxPerJob || globalCurrent < int32(maxLargeFiles)
-			
+
 			if !canProceed {
 				if shouldLogLargeFileWait() {
 					log.Printf("[LargeFile] Task %d (Job %d) waiting: job has %d large files, max per job=%d, global=%d/%d",
@@ -1023,7 +1046,7 @@ func processTask(t TransferTask) {
 				time.Sleep(5 * time.Second)
 				continue
 			}
-			
+
 			if atomic.LoadInt32(&activeSmallFileCount) == 0 {
 				if isRetry {
 					current := atomic.LoadInt32(&activeRetryLargeFileCount)

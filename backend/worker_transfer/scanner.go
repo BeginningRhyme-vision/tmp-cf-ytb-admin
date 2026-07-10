@@ -25,12 +25,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Scanner Worker
-// 1. Polls Backend for PENDING TransferJobs
-// 2. Lists Source S3/R2
-// 3. Batches inserts to Backend
-// 4. Updates Status to RUNNING
-
 type TransferJob struct {
 	JobID            uint             `json:"job_id"`
 	SrcDir           string           `json:"src_dir"`
@@ -164,13 +158,11 @@ func processJob(job TransferJob) {
 	jobJSON, _ := json.Marshal(job)
 	log.Printf("Processing Job: %s", string(jobJSON))
 
-	// 1. Update status to RUNNING
 	if err := updateJobStatus(job.JobID, "RUNNING", nil, ""); err != nil {
 		log.Printf("Failed to set RUNNING for job %d: %v", job.JobID, err)
 		return
 	}
 
-	// 2. Init S3 Source Client
 	s3Client, err := initSourceS3()
 	if err != nil {
 		log.Printf("Failed to init S3 for job %d: %v", job.JobID, err)
@@ -178,27 +170,32 @@ func processJob(job TransferJob) {
 		return
 	}
 
-	// 3. List and Batch Insert
 	bucketName := getBucketFromEndpoint(cfg.Storage.Src.Endpoint)
 	prefix := strings.TrimSpace(job.SrcDir)
 	log.Printf("Listing objects for job %d in bucket '%s' with prefix '%s'", job.JobID, bucketName, prefix)
 
-	paginator := s3.NewListObjectsV2Paginator(s3Client, &s3.ListObjectsV2Input{
+	input := &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucketName),
 		Prefix: aws.String(prefix),
-	})
+	}
+
+	isIncremental := job.PeriodicInterval > 0 && job.LastScanTime != nil
+	if isIncremental {
+		log.Printf("Incremental scan: job %d will filter objects modified since %v",
+			job.JobID, *job.LastScanTime)
+	}
+
+	paginator := s3.NewListObjectsV2Paginator(s3Client, input)
 
 	count := 0
 	skipped := 0
 	pages := 0
 	lastUpdate := time.Now()
 
-	// Channel for async sending
 	taskChan := make(chan TransferTaskInput, 1500)
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	// Consumer Goroutine
 	go func() {
 		defer wg.Done()
 		var internalBatch []TransferTaskInput
@@ -208,10 +205,9 @@ func processJob(job TransferJob) {
 				if err := sendBatch(job.JobID, internalBatch); err != nil {
 					log.Printf("Failed to send batch for job %d: %v", job.JobID, err)
 				}
-				internalBatch = nil // Clear
+				internalBatch = nil
 			}
 		}
-		// Flush remaining
 		if len(internalBatch) > 0 {
 			if err := sendBatch(job.JobID, internalBatch); err != nil {
 				log.Printf("Failed to send final batch for job %d: %v", job.JobID, err)
@@ -224,7 +220,6 @@ func processJob(job TransferJob) {
 		PagesScanned.Inc()
 		log.Printf("Requesting page %d for job %d...", pages, job.JobID)
 
-		// Retry logic with exponential backoff
 		var page *s3.ListObjectsV2Output
 		var err error
 		maxRetries := 5
@@ -234,12 +229,11 @@ func processJob(job TransferJob) {
 		for retryCount < maxRetries {
 			page, err = paginator.NextPage(context.TODO())
 			if err == nil {
-				break // Success, exit retry loop
+				break
 			}
 
 			log.Printf("ListObjectsV2 failed for job %d on page %d (attempt %d/%d): %v", job.JobID, pages, retryCount+1, maxRetries, err)
 
-			// Check if the error is due to rate limiting
 			errMsg := err.Error()
 			isRateLimited := strings.Contains(strings.ToLower(errMsg), "ratelimit") ||
 				strings.Contains(strings.ToLower(errMsg), "throttled") ||
@@ -248,14 +242,12 @@ func processJob(job TransferJob) {
 
 			if isRateLimited {
 				log.Printf("Detected rate limiting for job %d, applying backoff strategy", job.JobID)
-				// Use a longer delay for rate limiting
-				delay := baseDelay * time.Duration(1<<uint(retryCount)) // Exponential backoff
+				delay := baseDelay * time.Duration(1<<uint(retryCount))
 				if retryCount > 0 {
 					log.Printf("Rate limited, waiting for %v before retry %d/%d", delay, retryCount+1, maxRetries)
 				}
 				time.Sleep(delay)
 			} else {
-				// Standard error - shorter delay
 				delay := baseDelay * time.Duration(1<<uint(retryCount)) / 2
 				if delay < baseDelay {
 					delay = baseDelay
@@ -270,7 +262,7 @@ func processJob(job TransferJob) {
 		if err != nil {
 			log.Printf("ListObjectsV2 failed for job %d on page %d after %d retries: %v", job.JobID, pages, maxRetries, err)
 			updateJobStatus(job.JobID, "FAILED", nil, fmt.Sprintf("List failed on page %d after %d retries: %v", pages, maxRetries, err))
-			close(taskChan) // Ensure consumer stops
+			close(taskChan)
 			return
 		}
 
@@ -281,7 +273,11 @@ func processJob(job TransferJob) {
 				continue
 			}
 
-			// 3.1 Filter Include/Exclude
+			if isIncremental && obj.LastModified.Before(*job.LastScanTime) {
+				skipped++
+				continue
+			}
+
 			match := func(pattern, name string) (bool, error) {
 				if strings.Contains(pattern, "/") {
 					return path.Match(pattern, name)
@@ -312,40 +308,34 @@ func processJob(job TransferJob) {
 			count++
 		}
 
-		// Periodic Job Update (Heartbeat / Metadata Refresh)
-		if time.Since(lastUpdate) > 10*time.Second { // Check every 10s roughly (per page)
-			// Refresh Job Config
+		if time.Since(lastUpdate) > 10*time.Second {
 			latestJob, err := getJob(job.JobID)
 			if err == nil {
-				// Update filters if changed
 				job.Include = latestJob.Include
 				job.Exclude = latestJob.Exclude
 				job.IsIncremental = latestJob.IsIncremental
 
-				// Optional: Check status. If Cancelled, abort?
 				if latestJob.Status != "RUNNING" && latestJob.Status != "PENDING" {
 					log.Printf("Job %d status changed to %s. Aborting scan.", job.JobID, latestJob.Status)
 					close(taskChan)
-					return // Stop scanning
+					return
 				}
 			} else {
 				log.Printf("Failed to refresh job %d: %v", job.JobID, err)
 			}
 
-			// Update Status / Heartbeat
 			msg := fmt.Sprintf("Scanning... Pages: %d, Tasks: %d, Skipped: %d", pages, count, skipped)
 			updateJobStatus(job.JobID, "RUNNING", nil, msg)
 			lastUpdate = time.Now()
 		}
 
 		if pages > 0 {
-			standardDelay := 50 * time.Millisecond
-			time.Sleep(standardDelay)
+			time.Sleep(50 * time.Millisecond)
 		}
 	}
 
-	close(taskChan) // Signal consumer to finish
-	wg.Wait()       // Wait for consumer to finish processing
+	close(taskChan)
+	wg.Wait()
 
 	log.Printf("Job %d scanned. Total pages: %d. New tasks: %d, Skipped (old): %d", job.JobID, pages, count, skipped)
 	resultMsg := fmt.Sprintf("Scanned %d pages. Tasks: %d, Skipped: %d", pages, count, skipped)
@@ -395,7 +385,6 @@ func sendBatch(jobID uint, tasks []TransferTaskInput) error {
 }
 
 func initSourceS3() (*s3.Client, error) {
-	// Normalize endpoint to http/https as AWS SDK BaseEndpoint requires a web URI
 	normalized := cfg.Storage.Src.Endpoint
 	isS3 := strings.HasPrefix(normalized, "s3://")
 	if isS3 {
@@ -407,40 +396,27 @@ func initSourceS3() (*s3.Client, error) {
 
 	u, err := url.Parse(normalized)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid endpoint: %v", err)
 	}
 
-	host := u.Host
-	if isS3 {
-		parts := strings.SplitN(u.Host, ".", 2)
-		if len(parts) == 2 {
-			host = parts[1]
-		}
-	}
-
-	baseEndpoint := fmt.Sprintf("%s://%s", u.Scheme, host)
+	baseEndpoint := u.Scheme + "://" + u.Host
 
 	httpTransport := &http.Transport{
-		MaxIdleConns:        64,
-		MaxIdleConnsPerHost: 64,
-		IdleConnTimeout:     60 * time.Second,
-		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     30 * time.Second,
 		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
+			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 	}
 
 	c, err := awsconfig.LoadDefaultConfig(context.TODO(),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			cfg.Storage.Src.AccessKey,
-			cfg.Storage.Src.SecretKey,
-			"",
-		)),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.Storage.Src.AccessKey, cfg.Storage.Src.SecretKey, "")),
 		awsconfig.WithRegion("auto"),
 		awsconfig.WithHTTPClient(&http.Client{
 			Transport: httpTransport,
-			Timeout:   60 * time.Second,
+			Timeout:   30 * time.Second,
 		}),
 	)
 	if err != nil {

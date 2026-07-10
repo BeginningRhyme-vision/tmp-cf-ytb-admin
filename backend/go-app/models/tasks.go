@@ -47,13 +47,13 @@ type FfmpegTask struct {
 	S3Endpoint   string    `json:"s3_endpoint"`
 	S3Bucket     string    `json:"s3_bucket"`
 	S3Prefix     string    `json:"s3_prefix"`
-	S3UploadPrefix string  `json:"s3_upload_prefix"`
-		S3AK           string    `json:"s3_ak"`
-		S3SK           string    `json:"s3_sk"`
-		Region         string    `json:"region"`
-		IsIncremental  bool      `json:"is_incremental"`
-		Status         string    `json:"status"` // PENDING, RUNNING, COMPLETED, FAILED
-		ErrorMessage   string    `json:"error_message"`
+	S3UploadPrefix string    `json:"s3_upload_prefix"`
+	S3AK           string    `json:"s3_ak"`
+	S3SK           string    `json:"s3_sk"`
+	Region         string    `json:"region"`
+	IsIncremental  bool      `json:"is_incremental"`
+	Status         string    `json:"status"` // PENDING, RUNNING, COMPLETED, FAILED
+	ErrorMessage   string    `json:"error_message"`
 	VideoSize      int64     `json:"video_size"`
 	AudioSize      int64     `json:"audio_size"`
 	WorkerID     string    `json:"worker_id"`

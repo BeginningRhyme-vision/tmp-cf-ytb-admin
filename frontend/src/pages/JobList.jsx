@@ -359,6 +359,7 @@ const JobList = () => {
   const statusColors = {
     PENDING: 'default',
     RUNNING: 'processing',
+    PHASEDCOMPLETED: 'cyan',
     PAUSED: 'warning',
     STOPPED: 'error',
     COMPLETED: 'success',
@@ -460,7 +461,7 @@ const JobList = () => {
       title: 'Status', 
       dataIndex: 'status', 
       key: 'status',
-      render: (status) => <Tag color={statusColors[status]}>{status}</Tag>
+      render: (status) => <Tag color={statusColors[status] || 'default'}>{status}</Tag>
     },
     {
       title: 'Success Size',
@@ -485,7 +486,7 @@ const JobList = () => {
           {(record.status === 'PENDING' || record.status === 'PAUSED' || record.status === 'STOPPED' || record.status === 'FAILED') && (
             <Button icon={<PlayCircleOutlined />} size="small" onClick={() => handleAction(record.job_id, 'start')}>Start</Button>
           )}
-          {record.status === 'RUNNING' && (
+          {(record.status === 'RUNNING' || record.status === 'PHASEDCOMPLETED') && (
             <Button icon={<StopOutlined />} size="small" danger onClick={() => handleAction(record.job_id, 'stop')}>Stop</Button>
           )}
           {record.failed_count > 0 && (
@@ -622,7 +623,7 @@ const JobList = () => {
               { label: 'Delete Source', value: selectedJob.delete_source ? 'Yes' : 'No' },
               { label: 'Incremental', value: selectedJob.is_incremental ? 'Yes' : 'No' },
               ...(selectedJob.is_incremental ? [{ label: 'Periodic Interval', value: `${selectedJob.periodic_interval} s` }] : []),
-              { label: 'Status', value: <Tag color={statusColors[selectedJob.status]}>{selectedJob.status}</Tag> },
+              { label: 'Status', value: <Tag color={statusColors[selectedJob.status] || 'default'}>{selectedJob.status}</Tag> },
               { label: 'Success Size', value: formatBytes(selectedJob.success_size_bytes) },
               { label: 'Total Count', value: selectedJob.total_count },
               { label: 'Pending Count', value: selectedJob.pending_count },

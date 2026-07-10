@@ -26,6 +26,29 @@ type CreateTransferJobRequest struct {
 	Tasks []string `json:"tasks"`
 }
 
+type transferTaskCounts struct {
+	Total   int64
+	Pending int64
+	Running int64
+	Success int64
+	Failed  int64
+}
+
+func getTransferTaskCounts(jobID uint) (transferTaskCounts, error) {
+	var counts transferTaskCounts
+	err := database.DB.Model(&models.TransferTask{}).
+		Where("job_id = ?", jobID).
+		Select(`
+			COUNT(*) as total,
+			COALESCE(SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END), 0) as pending,
+			COALESCE(SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END), 0) as running,
+			COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0) as success,
+			COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) as failed
+		`).
+		Scan(&counts).Error
+	return counts, err
+}
+
 func CreateTransferJob(c *gin.Context) {
 	var req CreateTransferJobRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -216,16 +239,25 @@ func StartTransferJob(c *gin.Context) {
 		return
 	}
 
-	// 如果是非增量任务并且已经全部成功完成（success_count = total_count）
-	// 只尝试重试可能的失败任务，而不是重新扫描
-	if !job.IsIncremental && job.TotalCount > 0 && job.SuccessCount >= job.TotalCount {
-		// 只触发重试逻辑，不重置扫描时间，避免重新扫描
-		go RetryTransferTasksLogic(int(job.JobID), job.Status)
-	} else {
-		// 其他情况正常处理
-		ensureTxBuffer(int64(job.JobID))
-		triggerTxRefill(int64(job.JobID))
+	// 对非增量任务，优先按 transfer_tasks 的真实状态决定是否只做失败重试。
+	// 这样可以避免历史缓存计数不准时误触发重新扫描。
+	if !job.IsIncremental {
+		counts, err := getTransferTaskCounts(job.JobID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to inspect transfer tasks: " + err.Error()})
+			return
+		}
+
+		if counts.Total > 0 && counts.Pending == 0 && counts.Running == 0 {
+			go RetryTransferTasksLogic(int(job.JobID), job.Status)
+			c.JSON(http.StatusOK, job)
+			return
+		}
 	}
+
+	// 其他情况正常处理
+	ensureTxBuffer(int64(job.JobID))
+	triggerTxRefill(int64(job.JobID))
 
 	c.JSON(http.StatusOK, job)
 }

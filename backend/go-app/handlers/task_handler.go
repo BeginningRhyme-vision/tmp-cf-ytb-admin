@@ -122,7 +122,7 @@ func reactivateTransferJobOnPendingWork(jobID int64) {
 		UPDATE transfer_jobs
 		SET
 			status = CASE
-				WHEN status IN (?, ?, ?) THEN ?
+				WHEN status IN (?, ?) THEN ?
 				ELSE status
 			END,
 			consecutive_idle_scans = 0,
@@ -132,7 +132,6 @@ func reactivateTransferJobOnPendingWork(jobID int64) {
 	`,
 		models.StatusCompleted,
 		models.StatusPhasedCompleted,
-		models.StatusFailed,
 		models.StatusPending,
 		jobID,
 	)
@@ -143,7 +142,7 @@ func promoteTransferJobToRunning(jobID int64) {
 		UPDATE transfer_jobs
 		SET
 			status = CASE
-				WHEN status IN (?, ?, ?, ?) THEN ?
+				WHEN status IN (?, ?, ?) THEN ?
 				ELSE status
 			END,
 			consecutive_idle_scans = 0,
@@ -154,7 +153,6 @@ func promoteTransferJobToRunning(jobID int64) {
 		models.StatusPending,
 		models.StatusCompleted,
 		models.StatusPhasedCompleted,
-		models.StatusFailed,
 		models.StatusRunning,
 		jobID,
 	)
@@ -2683,6 +2681,13 @@ func BatchUpdateTransfer(c *gin.Context) {
 	}
 	pipe := database.RDB.Pipeline()
 	successSizeIncrements := make(map[int64]int64)
+	type jobAction struct {
+		jobID     int64
+		status    string
+		oldStatus string
+	}
+	var jobActions []jobAction
+	dbTasks := make([]models.TransferTask, 0, len(updates))
 
 	for i, u := range updates {
 		var taskKey string
@@ -2723,14 +2728,12 @@ func BatchUpdateTransfer(c *gin.Context) {
 			}
 		}
 
-		// Track status change
 		if oldStatus != "" && oldStatus != u.Status {
-			trackTxStatusChange(u.JobID, oldStatus, u.Status)
-			if u.Status == "RUNNING" {
-				promoteTransferJobToRunning(u.JobID)
-			} else if u.Status == "PENDING" {
-				reactivateTransferJobOnPendingWork(u.JobID)
-			}
+			jobActions = append(jobActions, jobAction{
+				jobID:     u.JobID,
+				status:    u.Status,
+				oldStatus: oldStatus,
+			})
 		}
 
 		// Update Redis
@@ -2766,17 +2769,38 @@ func BatchUpdateTransfer(c *gin.Context) {
 			dbTask.CompletedAt = u.CompletedAt
 		}
 
-		// Use Upsert to update or create the task in database
-		database.DB.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "id"}},
-			DoUpdates: clause.AssignmentColumns([]string{"status", "worker_id", "error_message", "retry_count", "started_at", "completed_at", "updated_at"}),
-		}).Create(&dbTask)
+		dbTasks = append(dbTasks, dbTask)
+	}
+
+	err = database.DB.Transaction(func(tx *gorm.DB) error {
+		for i := range dbTasks {
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "id"}},
+				DoUpdates: clause.AssignmentColumns([]string{"status", "worker_id", "error_message", "retry_count", "started_at", "completed_at", "updated_at"}),
+			}).Create(&dbTasks[i]).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync transfer tasks to database: " + err.Error()})
+		return
 	}
 
 	_, err = pipe.Exec(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+
+	for _, action := range jobActions {
+		trackTxStatusChange(action.jobID, action.oldStatus, action.status)
+		if action.status == "RUNNING" {
+			promoteTransferJobToRunning(action.jobID)
+		} else if action.status == "PENDING" {
+			reactivateTransferJobOnPendingWork(action.jobID)
+		}
 	}
 
 	for jobID, bytes := range successSizeIncrements {
@@ -2874,12 +2898,6 @@ func ResetTransferTask(c *gin.Context) {
 			return
 		}
 
-		database.RDB.Set(ctx, taskKey, data, 0)
-
-		// Track status change
-		trackTxStatusChange(jid, oldStatus, task.Status)
-		reactivateTransferJobOnPendingWork(jid)
-
 		// Sync to database
 		now := time.Now()
 		dbTask := models.TransferTask{
@@ -2893,10 +2911,21 @@ func ResetTransferTask(c *gin.Context) {
 			UpdatedAt:  now,
 		}
 
-		database.DB.Clauses(clause.OnConflict{
+		if err := database.DB.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "id"}},
 			DoUpdates: clause.AssignmentColumns([]string{"status", "worker_id", "error_message", "retry_count", "updated_at"}),
-		}).Create(&dbTask)
+		}).Create(&dbTask).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to sync reset task to database: " + err.Error()})
+			return
+		}
+
+		if err := database.RDB.Set(ctx, taskKey, data, 0).Err(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update reset task in redis: " + err.Error()})
+			return
+		}
+
+		trackTxStatusChange(jid, oldStatus, task.Status)
+		reactivateTransferJobOnPendingWork(jid)
 
 		found = true
 		break

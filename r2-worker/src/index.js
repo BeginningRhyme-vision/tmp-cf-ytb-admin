@@ -14,6 +14,13 @@ function isRetryableStatus(status) {
   return status === 408 || status === 429 || (status >= 500 && status <= 599);
 }
 
+function getDestinationCredentials(env, destUrl) {
+  const s3Host = destUrl.hostname;
+  const accessKeyId = env[`${s3Host}_ak`] || env.AWS_ACCESS_KEY_ID;
+  const secretAccessKey = env[`${s3Host}_sk`] || env.AWS_SECRET_ACCESS_KEY;
+  return { s3Host, accessKeyId, secretAccessKey };
+}
+
 function createTimeoutController(timeoutMs) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
@@ -132,10 +139,11 @@ async function processDownloadMessage(task, env) {
   const start = offset
   const end = offset + size - 1
   const safeDest = redactDestUrl(r2Key, partNumber)
+  const safeSource = redactSourceUrl(fileUrl, start, end)
   const maxAttempts = Math.max(1, Number.parseInt(env?.UPLOAD_RETRY_ATTEMPTS || "3", 10) || 3)
 
   try {
-    console.log(`Download task: part=${partNumber} size=${size} range=${start}-${end} source=${fileUrl} dest=${safeDest}`)
+    console.log(`Download task: part=${partNumber} size=${size} range=${start}-${end} source=${safeSource} dest=${safeDest}`)
     const userAgents = [
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -183,13 +191,14 @@ async function processDownloadMessage(task, env) {
 
     let destAwsClient = null;
     if (!isPresignedUrl) {
-      if (!env.SOURCE_ACCESS_KEY_ID || !env.SOURCE_SECRET_ACCESS_KEY) {
-        throw new Error("Missing required environment variables: SOURCE_ACCESS_KEY_ID and SOURCE_SECRET_ACCESS_KEY must be set in wrangler.toml or as environment variables");
+      const { s3Host, accessKeyId, secretAccessKey } = getDestinationCredentials(env, destUrl);
+      if (!accessKeyId || !secretAccessKey) {
+        throw new Error(`Missing required environment variables for destination S3 (${s3Host}): ${s3Host}_ak/${s3Host}_sk or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY`);
       }
 
       destAwsClient = new AwsClient({
-        accessKeyId: env.SOURCE_ACCESS_KEY_ID,
-        secretAccessKey: env.SOURCE_SECRET_ACCESS_KEY,
+        accessKeyId,
+        secretAccessKey,
         service: "s3",
         region: "auto",
       });
@@ -215,7 +224,7 @@ async function processDownloadMessage(task, env) {
             await sleep(backoffMs(attempt));
             continue;
           }
-          throw createHttpError(502, `Failed to download from source: ${sourceResponse.status} ${sourceResponse.statusText}`);
+          throw createHttpError(sourceResponse.status, `Failed to download from source: ${sourceResponse.status} ${sourceResponse.statusText}`);
         }
 
         if (!sourceResponse.body) {
@@ -259,7 +268,7 @@ async function processDownloadMessage(task, env) {
               await sleep(backoffMs(attempt));
               continue;
             }
-            throw createHttpError(502, `Failed to upload to S3: ${s3Response.status} ${errorText}`);
+            throw createHttpError(s3Response.status, `Failed to upload to S3: ${s3Response.status} ${errorText}`);
           }
 
           const etag = s3Response.headers.get("etag") || s3Response.headers.get("ETag");
@@ -302,7 +311,7 @@ async function processDownloadMessage(task, env) {
 
     throw createHttpError(502, `Upload failed after retries for ${safeDest} part=${partNumber}`);
   } catch (error) {
-    console.error(`Processing failed for ${safeDest} (part ${partNumber}). Error: ${error.message}. source=${fileUrl}`);
+    console.error(`Processing failed for ${safeDest} (part ${partNumber}). Error: ${error.message}. source=${safeSource}`);
     throw error;
   }
 }
@@ -317,7 +326,19 @@ function redactSourceUrl(fileUrl, start, end) {
   try {
     const u = new URL(fileUrl);
     const qp = u.searchParams;
-    const redactKeys = new Set([]);
+    const redactKeys = new Set([
+      "X-Amz-Algorithm",
+      "X-Amz-Credential",
+      "X-Amz-Date",
+      "X-Amz-Expires",
+      "X-Amz-Security-Token",
+      "X-Amz-Signature",
+      "X-Amz-SignedHeaders",
+      "sig",
+      "signature",
+      "token",
+      "auth",
+    ]);
     const parts = [];
     for (const [k, v] of qp.entries()) {
       if (redactKeys.has(k)) {
@@ -386,9 +407,8 @@ async function processMessage(task, env) {
       ...(sourceEndpoint ? { endpoint: sourceEndpoint } : {}),
     });
 
-    const s3Host = new URL(s3Url).hostname;
-    const destAccessKey = env[s3Host + "_ak"] || env.AWS_ACCESS_KEY_ID;
-    const destSecretKey = env[s3Host + "_sk"] || env.AWS_SECRET_ACCESS_KEY;
+    const uploadUrl = new URL(s3Url);
+    const { s3Host, accessKeyId: destAccessKey, secretAccessKey: destSecretKey } = getDestinationCredentials(env, uploadUrl);
     
     if (!destAccessKey || !destSecretKey) {
       throw new Error(`Missing required environment variables for destination S3 (${s3Host}): ${s3Host}_ak/${s3Host}_sk or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY`);
@@ -400,8 +420,6 @@ async function processMessage(task, env) {
       region: env.AWS_REGION || "auto",
       service: "s3",
     });
-
-    const uploadUrl = new URL(s3Url);
 
     if (partNumber !== -1) {
       uploadUrl.searchParams.set("partNumber", partNumber);
@@ -431,7 +449,7 @@ async function processMessage(task, env) {
             await sleep(backoffMs(attempt));
             continue;
           }
-          throw createHttpError(502, `Failed to download from source: ${sourceResponse.status}`);
+          throw createHttpError(sourceResponse.status, `Failed to download from source: ${sourceResponse.status}`);
         }
 
         if (!sourceResponse.body) {
@@ -468,7 +486,7 @@ async function processMessage(task, env) {
               await sleep(backoffMs(attempt));
               continue;
             }
-            throw createHttpError(502, `Failed to upload to S3: ${s3Response.status} ${errorText}`);
+            throw createHttpError(s3Response.status, `Failed to upload to S3: ${s3Response.status} ${errorText}`);
           }
 
           const etag = s3Response.headers.get("etag") || s3Response.headers.get("ETag");

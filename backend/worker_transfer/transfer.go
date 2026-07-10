@@ -81,6 +81,7 @@ var (
 	maxTimeoutSecs           int
 	minThroughputMBPS        int
 	chunkReadTimeoutSecs     int
+	transferServiceRetries   int
 
 	s3Clients sync.Map // Endpoint -> *s3.Client (Cache for Destinations)
 	srcClient *s3.Client
@@ -222,6 +223,7 @@ const (
 	DefaultMaxTimeoutSecs           = 10800
 	DefaultMinThroughputMBPS        = 2
 	DefaultChunkReadTimeoutSecs     = 30
+	DefaultTransferServiceRetries   = 3
 
 	DefaultAdaptiveConcurrencyEnabled    = true
 	DefaultMinWorkers                    = 8
@@ -275,6 +277,7 @@ func runTransfer() {
 	maxTimeoutSecs = getEnvInt("TRANSFER_MAX_TIMEOUT_SECS", DefaultMaxTimeoutSecs)
 	minThroughputMBPS = getEnvInt("TRANSFER_MIN_THROUGHPUT_MBPS", DefaultMinThroughputMBPS)
 	chunkReadTimeoutSecs = getEnvInt("TRANSFER_CHUNK_READ_TIMEOUT_SECS", DefaultChunkReadTimeoutSecs)
+	transferServiceRetries = getEnvInt("TRANSFER_SERVICE_RETRY_ATTEMPTS", DefaultTransferServiceRetries)
 
 	// Adaptive Concurrency Control Configuration
 	adaptiveConcurrencyEnabled = getEnvBool("TRANSFER_ADAPTIVE_CONCURRENCY_ENABLED", DefaultAdaptiveConcurrencyEnabled)
@@ -986,9 +989,8 @@ func processTask(t TransferTask) {
 
 	if t.RetryCount > 0 {
 		srcBucket := getBucketFromEndpoint(cfg.Storage.Src.Endpoint)
-		srcClient, err := createS3Client(cfg.Storage.Src.Endpoint, cfg.Storage.Src.AccessKey, cfg.Storage.Src.SecretKey)
-		if err != nil {
-			log.Printf("Failed to create source S3 client for task %d: %v", t.ID, err)
+		if srcClient == nil {
+			log.Printf("Source S3 client is not initialized for task %d", t.ID)
 		} else {
 			headCtx, headCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer headCancel()
@@ -1341,6 +1343,8 @@ func transferFile(ctx context.Context, srcURL string, dstClient *s3.Client, dstB
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	errAbort := make(chan error, 1)
+	multipartCtx, cancelMultipart := context.WithCancel(ctx)
+	defer cancelMultipart()
 
 	sem := make(chan struct{}, partConcurrency)
 
@@ -1357,9 +1361,9 @@ func transferFile(ctx context.Context, srcURL string, dstClient *s3.Client, dstB
 			defer wg.Done()
 			for !acquirePartSlot(sem) {
 				select {
-				case <-ctx.Done():
+				case <-multipartCtx.Done():
 					select {
-					case errAbort <- ctx.Err():
+					case errAbort <- multipartCtx.Err():
 					default:
 					}
 					return
@@ -1370,13 +1374,14 @@ func transferFile(ctx context.Context, srcURL string, dstClient *s3.Client, dstB
 
 			partSizeBytes := e - s + 1
 			partTimeout := calculatePartTimeout(partSizeBytes)
-			partCtx, partCancel := context.WithTimeout(ctx, partTimeout)
+			partCtx, partCancel := context.WithTimeout(multipartCtx, partTimeout)
 			defer partCancel()
 
 			etag, err := callTransferService(partCtx, srcURL, dstUrl, partSizeBytes, s, uploadID, int(pNum))
 			if err != nil {
 				select {
 				case errAbort <- err:
+					cancelMultipart()
 				default:
 				}
 				return
@@ -1434,7 +1439,11 @@ func callTransferService(ctx context.Context, srcUrl, dstUrl string, size, offse
 	body, _ := json.Marshal(payload)
 
 	var lastErr error
-	for i := 0; i < 5; i++ {
+	attempts := transferServiceRetries
+	if attempts < 1 {
+		attempts = 1
+	}
+	for i := 0; i < attempts; i++ {
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
@@ -1486,6 +1495,9 @@ func callTransferService(ctx context.Context, srcUrl, dstUrl string, size, offse
 			}
 		}
 		lastErr = fmt.Errorf("status %d body %s", resp.StatusCode, string(respBody))
+		if !isRetryableTransferServiceStatus(resp.StatusCode) {
+			return "", lastErr
+		}
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
@@ -1494,6 +1506,10 @@ func callTransferService(ctx context.Context, srcUrl, dstUrl string, size, offse
 		}
 	}
 	return "", fmt.Errorf("service call failed: %v", lastErr)
+}
+
+func isRetryableTransferServiceStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
 }
 
 func constructVirtualHostURL(endpointStr, bucket, key string) (string, error) {
@@ -1535,6 +1551,11 @@ func initSourceClient() {
 }
 
 func createS3Client(endpoint, ak, sk string) (*s3.Client, error) {
+	cacheKey := endpoint + "\n" + ak + "\n" + sk
+	if cached, ok := s3Clients.Load(cacheKey); ok {
+		return cached.(*s3.Client), nil
+	}
+
 	normalized := endpoint
 	isS3 := strings.HasPrefix(normalized, "s3://")
 	if isS3 {
@@ -1585,10 +1606,14 @@ func createS3Client(endpoint, ak, sk string) (*s3.Client, error) {
 		return nil, err
 	}
 
-	return s3.NewFromConfig(c, func(o *s3.Options) {
+	client := s3.NewFromConfig(c, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(baseEndpoint)
 		o.UsePathStyle = false
-	}), nil
+	})
+	if actual, loaded := s3Clients.LoadOrStore(cacheKey, client); loaded {
+		return actual.(*s3.Client), nil
+	}
+	return client, nil
 }
 
 func acquireTasks() ([]TransferTask, error) {

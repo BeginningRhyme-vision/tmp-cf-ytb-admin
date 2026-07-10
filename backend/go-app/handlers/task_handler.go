@@ -38,6 +38,10 @@ var (
 	statsMutex      sync.Mutex
 	jobShardingMode sync.Map
 
+	// Transfer Stats Buffer
+	txStatsBuffer = make(map[int64]*JobDelta)
+	txStatsMutex  sync.Mutex
+
 	// Counter for periodic database checks
 	txAcquireRequestCount int32
 )
@@ -116,6 +120,7 @@ func StartBufferService() {
 				checkAndRefillTxBuffers()
 				checkAndRefillFfmpegBuffers()
 				flushStats()
+				flushTxStats()
 			case <-monitorTicker.C:
 				scanStuckYoutubeTasks()
 			}
@@ -303,6 +308,105 @@ func trackStatusChange(jobID int64, oldStatus, newStatus string) {
 		d.Success++
 	case "FAILED":
 		d.Failed++
+	}
+}
+
+func trackTxStatusChange(jobID int64, oldStatus, newStatus string) {
+	if oldStatus == newStatus {
+		return
+	}
+
+	txStatsMutex.Lock()
+	defer txStatsMutex.Unlock()
+
+	if _, ok := txStatsBuffer[jobID]; !ok {
+		txStatsBuffer[jobID] = &JobDelta{}
+	}
+	d := txStatsBuffer[jobID]
+
+	// Helper to map status to bucket
+	getBucket := func(s string) string {
+		switch s {
+		case "PENDING":
+			return "PENDING"
+		case "COMPLETED":
+			return "COMPLETED"
+		case "FAILED":
+			return "FAILED"
+		default:
+			return "RUNNING"
+		}
+	}
+
+	oldBucket := getBucket(oldStatus)
+	newBucket := getBucket(newStatus)
+
+	if oldBucket == newBucket {
+		return
+	}
+
+	// Decrement old
+	switch oldBucket {
+	case "PENDING":
+		d.Pending--
+	case "RUNNING":
+		d.Running--
+	case "COMPLETED":
+		d.Success--
+	case "FAILED":
+		d.Failed--
+	}
+
+	// Increment new
+	switch newBucket {
+	case "PENDING":
+		d.Pending++
+	case "RUNNING":
+		d.Running++
+	case "COMPLETED":
+		d.Success++
+	case "FAILED":
+		d.Failed++
+	}
+}
+
+func flushTxStats() {
+	txStatsMutex.Lock()
+	if len(txStatsBuffer) == 0 {
+		txStatsMutex.Unlock()
+		return
+	}
+
+	// Copy and clear
+	snapshot := make(map[int64]JobDelta)
+	for jid, delta := range txStatsBuffer {
+		snapshot[jid] = *delta
+	}
+	txStatsBuffer = make(map[int64]*JobDelta)
+	txStatsMutex.Unlock()
+
+	// Execute updates
+	for jobID, delta := range snapshot {
+		// Construct query
+		// Using raw SQL for atomic updates
+		// We also update status based on the *new* counts
+		query := `
+			UPDATE transfer_jobs SET 
+				pending_count = GREATEST(0, pending_count + ?), 
+				running_count = GREATEST(0, running_count + ?), 
+				success_count = GREATEST(0, success_count + ?), 
+				failed_count = GREATEST(0, failed_count + ?),
+				status = CASE 
+					WHEN status = 'PENDING' AND (GREATEST(0, running_count + ?)) > 0 THEN 'RUNNING'
+					ELSE status 
+				END
+			WHERE job_id = ?
+		`
+		database.DB.Exec(query,
+			delta.Pending, delta.Running, delta.Success, delta.Failed, // For count updates
+			delta.Running, // For PENDING->RUNNING check
+			jobID,
+		)
 	}
 }
 
@@ -1599,9 +1703,16 @@ func addShardedTransferTasks(jobID int64, inputs []TransferTaskInput) (int, erro
 			totalSizeBytes += input.Size
 		}
 	}
-	if totalSizeBytes > 0 {
-		database.DB.Model(&models.TransferJob{}).Where("job_id = ?", jobID).
-			UpdateColumn("total_size_bytes", gorm.Expr("total_size_bytes + ?", totalSizeBytes))
+
+	// Update job statistics
+	if len(newInputs) > 0 {
+		db := database.DB.Model(&models.TransferJob{}).Where("job_id = ?", jobID)
+		db.UpdateColumn("total_count", gorm.Expr("total_count + ?", len(newInputs)))
+		db.UpdateColumn("pending_count", gorm.Expr("pending_count + ?", len(newInputs)))
+		
+		if totalSizeBytes > 0 {
+			db.UpdateColumn("total_size_bytes", gorm.Expr("total_size_bytes + ?", totalSizeBytes))
+		}
 	}
 
 	return len(tasks), nil
@@ -1721,9 +1832,16 @@ func addLegacyTransferTasks(jobID int64, inputs []TransferTaskInput) (int, error
 			totalSizeBytes += input.Size
 		}
 	}
-	if totalSizeBytes > 0 {
-		database.DB.Model(&models.TransferJob{}).Where("job_id = ?", jobID).
-			UpdateColumn("total_size_bytes", gorm.Expr("total_size_bytes + ?", totalSizeBytes))
+
+	// Update job statistics
+	if len(newInputs) > 0 {
+		db := database.DB.Model(&models.TransferJob{}).Where("job_id = ?", jobID)
+		db.UpdateColumn("total_count", gorm.Expr("total_count + ?", len(newInputs)))
+		db.UpdateColumn("pending_count", gorm.Expr("pending_count + ?", len(newInputs)))
+		
+		if totalSizeBytes > 0 {
+			db.UpdateColumn("total_size_bytes", gorm.Expr("total_size_bytes + ?", totalSizeBytes))
+		}
 	}
 
 	return len(tasks), nil
@@ -2370,10 +2488,13 @@ func BatchUpdateTransfer(c *gin.Context) {
 		var taskKey string
 		taskKey = fmt.Sprintf("tx:task:%d:%d", u.JobID, u.ID)
 
+		var oldStatus string = ""
 		val := existingJSONs[i]
 		if str, ok := val.(string); ok && str != "" {
 			var existing models.TransferTask
 			if json.Unmarshal([]byte(str), &existing) == nil {
+				oldStatus = existing.Status
+				
 				if existing.Status != "COMPLETED" && u.Status == "COMPLETED" && existing.Size > 0 {
 					successSizeIncrements[u.JobID] += existing.Size
 				}
@@ -2396,15 +2517,55 @@ func BatchUpdateTransfer(c *gin.Context) {
 				if u.Src == "" {
 					u.Src = existing.Src
 				}
+				if u.RetryCount == 0 && u.Status == "FAILED" && existing.Status != "FAILED" {
+					u.RetryCount = existing.RetryCount + 1
+				}
 			}
 		}
 
+		// Track status change
+		if oldStatus != "" && oldStatus != u.Status {
+			trackTxStatusChange(u.JobID, oldStatus, u.Status)
+		}
+
+		// Update Redis
 		data, err := json.Marshal(u)
 		if err != nil {
 			continue
 		}
-
 		pipe.Set(ctx, taskKey, data, 0)
+
+		// Sync to database
+		now := time.Now()
+		dbTask := models.TransferTask{
+			ID:           u.ID,
+			JobID:        u.JobID,
+			Src:          u.Src,
+			Size:         u.Size,
+			Status:       u.Status,
+			WorkerID:     u.WorkerID,
+			ErrorMessage: u.ErrorMessage,
+			RetryCount:   u.RetryCount,
+			UpdatedAt:    now,
+		}
+
+		if u.Status == "RUNNING" && u.StartedAt.IsZero() {
+			dbTask.StartedAt = now
+		} else if !u.StartedAt.IsZero() {
+			dbTask.StartedAt = u.StartedAt
+		}
+
+		if (u.Status == "COMPLETED" || u.Status == "FAILED") && u.CompletedAt.IsZero() {
+			dbTask.CompletedAt = now
+		} else if !u.CompletedAt.IsZero() {
+			dbTask.CompletedAt = u.CompletedAt
+		}
+
+		// Use Upsert to update or create the task in database
+		database.DB.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"status", "worker_id", "error_message", "retry_count", "started_at", "completed_at", "updated_at"}),
+		}).Create(&dbTask)
 	}
 
 	_, err = pipe.Exec(ctx)
@@ -2549,6 +2710,7 @@ func ResetTransferTask(c *gin.Context) {
 			continue
 		}
 
+		oldStatus := task.Status
 		resetTaskForAutoRetry(&task, req.Status)
 
 		data, err := json.Marshal(task)
@@ -2559,7 +2721,26 @@ func ResetTransferTask(c *gin.Context) {
 
 		database.RDB.Set(ctx, taskKey, data, 0)
 
-		database.DB.Exec("UPDATE transfer_jobs SET failed_count = failed_count - 1, pending_count = pending_count + 1 WHERE job_id = ?", jid)
+		// Track status change
+		trackTxStatusChange(jid, oldStatus, task.Status)
+
+		// Sync to database
+		now := time.Now()
+		dbTask := models.TransferTask{
+			ID:         task.ID,
+			JobID:      task.JobID,
+			Src:        task.Src,
+			Size:       task.Size,
+			Status:     task.Status,
+			WorkerID:   task.WorkerID,
+			RetryCount: task.RetryCount,
+			UpdatedAt:  now,
+		}
+
+		database.DB.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"status", "worker_id", "error_message", "retry_count", "updated_at"}),
+		}).Create(&dbTask)
 
 		found = true
 		break
@@ -3003,7 +3184,6 @@ func updateCompletedTransferJobs() {
 			status = ?
 			AND total_count > 0
 			AND periodic_interval = 0
-			AND last_scan_time IS NOT NULL
 			AND EXISTS (
 				SELECT 1 FROM transfer_tasks WHERE job_id = transfer_jobs.job_id
 			)

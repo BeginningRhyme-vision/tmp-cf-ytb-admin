@@ -50,14 +50,14 @@ type JobDelta struct {
 }
 
 const (
-	BufferSize       = 2000
-	FetchBatchSize   = 100
-	BufferLowWater   = 100 // Refill when below this
-	TxFetchBatchSize = 1000
-	LockExpiration   = 30 * time.Second
-	DedupShards      = 256   // 去重 Hash 分成 256 片
-	TaskBucketSize   = 50000 // 任务 ZSet 每 5 万个 ID 分一个桶
-	TxBufferLogInterval = 10 * time.Second // Log every 10 seconds
+	BufferSize              = 2000
+	FetchBatchSize          = 100
+	BufferLowWater          = 100 // Refill when below this
+	TxFetchBatchSize        = 1000
+	LockExpiration          = 30 * time.Second
+	DedupShards             = 256                // 去重 Hash 分成 256 片
+	TaskBucketSize          = 50000              // 任务 ZSet 每 5 万个 ID 分一个桶
+	TxBufferLogInterval     = 10 * time.Second   // Log every 10 seconds
 	LargeFileThresholdBytes = 1000 * 1024 * 1024 // 1GB
 )
 
@@ -239,7 +239,7 @@ func flushStats() {
 			delta.Pending, delta.Running, delta.Success, delta.Failed, // For count updates
 			delta.Running,                // For PENDING->RUNNING check
 			delta.Pending, delta.Running, // For RUNNING->COMPLETED check
-			delta.Success, delta.Failed,  // For total_count > 0 check
+			delta.Success, delta.Failed, // For total_count > 0 check
 			jobID,
 		)
 	}
@@ -1915,7 +1915,7 @@ func fillTxJobBuffer(jobID int64) {
 // 【新逻辑】分片读取
 func fillShardedTxBuffer(ctx context.Context, jobID int64) {
 	log.Printf("[fillShardedTxBuffer] Starting for job %d", jobID)
-	
+
 	// 新 Offset Key (无 {})
 	offsetKey := fmt.Sprintf("tx:job:%d:offset", jobID)
 	offsetStr, _ := database.RDB.Get(ctx, offsetKey).Result()
@@ -1986,8 +1986,44 @@ func fillShardedTxBuffer(ctx context.Context, jobID int64) {
 	}
 
 	if len(ids) == 0 {
-		log.Printf("[fillShardedTxBuffer] Job %d: no ids found, returning", jobID)
-		return
+		log.Printf("[fillShardedTxBuffer] Job %d: no ids found in Redis, checking database for pending tasks", jobID)
+
+		var pendingTasks []models.TransferTask
+		if err := database.DB.Where("job_id = ? AND status = ?", jobID, "PENDING").
+			Order("id ASC").Limit(TxFetchBatchSize).Find(&pendingTasks).Error; err != nil {
+			log.Printf("[fillShardedTxBuffer] Job %d: Failed to query pending tasks from database: %v", jobID, err)
+			return
+		}
+
+		if len(pendingTasks) > 0 {
+			log.Printf("[fillShardedTxBuffer] Job %d: Found %d pending tasks in database, writing back to Redis", jobID, len(pendingTasks))
+
+			for _, task := range pendingTasks {
+				bucketKey := getTaskBucketKey(jobID, task.ID)
+				database.RDB.ZAdd(ctx, bucketKey, redis.Z{Score: float64(task.ID), Member: fmt.Sprintf("%d", task.ID)})
+
+				taskKey := fmt.Sprintf("tx:task:%d:%d", jobID, task.ID)
+				taskData, _ := json.Marshal(task)
+				database.RDB.Set(ctx, taskKey, taskData, 0)
+
+				if task.ID > currentMaxID {
+					currentMaxID = task.ID
+				}
+			}
+
+			database.RDB.Set(ctx, maxIDKey, currentMaxID, 0)
+			database.RDB.Set(ctx, offsetKey, lastTaskID, 0)
+
+			log.Printf("[fillShardedTxBuffer] Job %d: Refilled %d tasks to Redis, maxID=%d", jobID, len(pendingTasks), currentMaxID)
+
+			ids = make([]string, len(pendingTasks))
+			for i, task := range pendingTasks {
+				ids[i] = fmt.Sprintf("%d", task.ID)
+			}
+		} else {
+			log.Printf("[fillShardedTxBuffer] Job %d: no pending tasks found in database either, returning", jobID)
+			return
+		}
 	}
 
 	// 获取详情
@@ -2973,7 +3009,7 @@ func updateCompletedTransferJobs() {
 			)
 			AND job_id NOT IN (
 				SELECT DISTINCT job_id FROM transfer_tasks
-				WHERE status IN ('PENDING', 'RUNNING')
+				WHERE status IN ('PENDING', 'RUNNING', 'FAILED')
 			)
 	`
 	result := database.DB.Exec(query, models.StatusCompleted, models.StatusRunning)

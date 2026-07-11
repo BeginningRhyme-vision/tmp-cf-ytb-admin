@@ -60,24 +60,26 @@ type cachedJob struct {
 }
 
 var (
-	jobCache                 sync.Map // JobID -> cachedJob
-	httpClient               *http.Client
-	transferClient           *http.Client
-	transferTransport        *http.Transport
-	workerCount              int
-	taskBufferSize           int
-	partConcurrency          int
-	multipartThreshold       int64
-	minPartSize              int64
-	maxRetryCount            int
-	retryBaseDelaySecs       int
-	retryScannerIntervalSecs int
-	minTimeoutSecs           int
-	maxTimeoutSecs           int
-	minThroughputMBPS        int
-	chunkReadTimeoutSecs     int
-	transferServiceRetries   int
-	s3ClientMaxConnections   int
+	jobCache                                 sync.Map // JobID -> cachedJob
+	httpClient                               *http.Client
+	transferClient                           *http.Client
+	transferTransport                        *http.Transport
+	workerCount                              int
+	taskBufferSize                           int
+	partConcurrency                          int
+	multipartThreshold                       int64
+	minPartSize                              int64
+	maxRetryCount                            int
+	retryBaseDelaySecs                       int
+	retryScannerIntervalSecs                 int
+	minTimeoutSecs                           int
+	maxTimeoutSecs                           int
+	minThroughputMBPS                        int
+	chunkReadTimeoutSecs                     int
+	transferServiceRetries                   int
+	transferServiceWorkerTimeoutSecs         int
+	transferServiceResponseHeaderTimeoutSecs int
+	s3ClientMaxConnections                   int
 
 	s3Clients sync.Map // Endpoint -> *s3.Client (Cache for Destinations)
 	srcClient *s3.Client
@@ -203,21 +205,23 @@ var (
 )
 
 const (
-	WorkerID                        = "go-transfer-1"
-	DefaultConcurrentWorkers        = 128
-	DefaultTaskBufferSize           = 256
-	DefaultPartConcurrency          = 16
-	DefaultMultipartThresholdMB     = 16
-	DefaultMinPartSizeMB            = 8
-	DefaultMaxConnections           = 2048
-	DefaultMaxRetryCount            = 3
-	DefaultRetryBaseDelaySecs       = 60
-	DefaultRetryScannerIntervalSecs = 30
-	DefaultMinTimeoutSecs           = 30
-	DefaultMaxTimeoutSecs           = 10800
-	DefaultMinThroughputMBPS        = 2
-	DefaultChunkReadTimeoutSecs     = 30
-	DefaultTransferServiceRetries   = 3
+	WorkerID                                        = "go-transfer-1"
+	DefaultConcurrentWorkers                        = 128
+	DefaultTaskBufferSize                           = 256
+	DefaultPartConcurrency                          = 16
+	DefaultMultipartThresholdMB                     = 16
+	DefaultMinPartSizeMB                            = 8
+	DefaultMaxConnections                           = 2048
+	DefaultMaxRetryCount                            = 3
+	DefaultRetryBaseDelaySecs                       = 60
+	DefaultRetryScannerIntervalSecs                 = 30
+	DefaultMinTimeoutSecs                           = 30
+	DefaultMaxTimeoutSecs                           = 10800
+	DefaultMinThroughputMBPS                        = 2
+	DefaultChunkReadTimeoutSecs                     = 30
+	DefaultTransferServiceRetries                   = 3
+	DefaultTransferServiceWorkerTimeoutSecs         = 60
+	DefaultTransferServiceResponseHeaderTimeoutSecs = 0
 
 	DefaultAdaptiveConcurrencyEnabled    = true
 	DefaultMinWorkers                    = 8
@@ -272,6 +276,8 @@ func runTransfer() {
 	minThroughputMBPS = getEnvInt("TRANSFER_MIN_THROUGHPUT_MBPS", DefaultMinThroughputMBPS)
 	chunkReadTimeoutSecs = getEnvInt("TRANSFER_CHUNK_READ_TIMEOUT_SECS", DefaultChunkReadTimeoutSecs)
 	transferServiceRetries = getEnvInt("TRANSFER_SERVICE_RETRY_ATTEMPTS", DefaultTransferServiceRetries)
+	transferServiceWorkerTimeoutSecs = getEnvInt("TRANSFER_SERVICE_WORKER_TIMEOUT_SECS", DefaultTransferServiceWorkerTimeoutSecs)
+	transferServiceResponseHeaderTimeoutSecs = getEnvInt("TRANSFER_SERVICE_RESPONSE_HEADER_TIMEOUT_SECS", DefaultTransferServiceResponseHeaderTimeoutSecs)
 	s3ClientMaxConnections = maxConnections
 	if s3ClientMaxConnections < 1 {
 		s3ClientMaxConnections = DefaultMaxConnections
@@ -339,7 +345,7 @@ func runTransfer() {
 			KeepAlive: 120 * time.Second,
 		}).DialContext,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
+		ResponseHeaderTimeout: calculateTransferServiceResponseHeaderTimeout(),
 	}
 	transferClient = &http.Client{
 		Transport: transferTransport,
@@ -433,8 +439,12 @@ func runTransfer() {
 func calculateDynamicTimeout(size int64, retryCount int) time.Duration {
 	minTimeout := time.Duration(minTimeoutSecs) * time.Second
 	maxTimeout := time.Duration(maxTimeoutSecs) * time.Second
+	serviceBudget := calculateTransferServiceExecutionBudget()
 
 	if size <= 0 {
+		if serviceBudget > minTimeout {
+			return serviceBudget
+		}
 		return minTimeout
 	}
 
@@ -452,6 +462,7 @@ func calculateDynamicTimeout(size int64, retryCount int) time.Duration {
 		retryMultiplier := float64(int64(1) << uint(shift))
 		calculated = time.Duration(float64(calculated) * retryMultiplier)
 	}
+	calculated += serviceBudget
 
 	if calculated < minTimeout {
 		return minTimeout
@@ -464,6 +475,41 @@ func calculateDynamicTimeout(size int64, retryCount int) time.Duration {
 
 func calculatePartTimeout(partSize int64) time.Duration {
 	return calculateDynamicTimeout(partSize, 0)
+}
+
+func calculateTransferServiceExecutionBudget() time.Duration {
+	attempts := transferServiceRetries
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	perAttemptTimeoutSecs := transferServiceWorkerTimeoutSecs
+	if perAttemptTimeoutSecs < 1 {
+		perAttemptTimeoutSecs = DefaultTransferServiceWorkerTimeoutSecs
+	}
+
+	// The worker does a source GET and a destination PUT before it can return headers.
+	perAttemptBudget := time.Duration(perAttemptTimeoutSecs*2) * time.Second
+	backoffBudget := time.Duration(0)
+	for attempt := 1; attempt < attempts; attempt++ {
+		backoffBudget += time.Duration(attempt) * time.Second
+	}
+
+	// Leave a small cushion for JSON parsing, TLS jitter, and response propagation.
+	return time.Duration(attempts)*perAttemptBudget + backoffBudget + 15*time.Second
+}
+
+func calculateTransferServiceResponseHeaderTimeout() time.Duration {
+	if transferServiceResponseHeaderTimeoutSecs > 0 {
+		return time.Duration(transferServiceResponseHeaderTimeoutSecs) * time.Second
+	}
+
+	headerTimeout := calculateTransferServiceExecutionBudget()
+	maxClientTimeout := time.Duration(maxTimeoutSecs) * time.Second
+	if maxClientTimeout > 0 && headerTimeout >= maxClientTimeout {
+		return 0
+	}
+	return headerTimeout
 }
 
 func acquireWorkerSlot() bool {
